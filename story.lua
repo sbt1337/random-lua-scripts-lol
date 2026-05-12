@@ -17,7 +17,7 @@ local Attacking = false
 
 local WEBHOOK = "https://discord.com/api/webhooks/1503794681803440321/qXasXkOVlDvjunThkHMv-2FzXsyBB74yamzlWDgygmxPnHRJ2xWRRBu5FOdXKj99jaQS"
 local LOW_HP_THRESHOLD = 0.35
-local UNDERGROUND_Y = -1000
+local UNDERGROUND_Y = 10 -- studs below current position
 local ATTACK_OFFSET = 8 -- studs away from zombie horizontally
 
 -- Rebirth steps from Rebirth.lua
@@ -123,14 +123,12 @@ local function GetNearestZombie()
     local Nearest, NearestDist = nil, math.huge
 
     for _, Model in ipairs(ZombieFolder:GetChildren()) do
-        local Root = Model:FindFirstChild("HumanoidRootPart")
-        local Hum = Model:FindFirstChildOfClass("Humanoid")
-        if Root and Hum and Hum.Health > 0 then
-            local Dist = (Root.Position - HRP.Position).Magnitude
-            if Dist < NearestDist then
-                Nearest = Root
-                NearestDist = Dist
-            end
+        local Root = Model.PrimaryPart or Model:FindFirstChildWhichIsA("BasePart")
+        if not Root then continue end
+        local Dist = (Root.Position - Vector3.new(HRP.Position.X, Root.Position.Y, HRP.Position.Z)).Magnitude
+        if Dist < NearestDist then
+            Nearest = Root
+            NearestDist = Dist
         end
     end
 
@@ -140,7 +138,7 @@ end
 -- TP underground (safe zone)
 local function GoUnderground()
     if HRP and HRP.Parent then
-        HRP.CFrame = CFrame.new(HRP.Position.X, UNDERGROUND_Y, HRP.Position.Z)
+        HRP.CFrame = CFrame.new(HRP.Position.X, HRP.Position.Y - UNDERGROUND_Y, HRP.Position.Z)
     end
 end
 
