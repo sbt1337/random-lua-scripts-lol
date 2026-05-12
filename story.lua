@@ -14,13 +14,31 @@ local HRP = Character:WaitForChild("HumanoidRootPart")
 local Running = true
 local LowHP = false
 local Attacking = false
+local AttackStartTime = 0
+local LastAttackPos = nil
+local StuckTimer = 0
+
+-- Stats for periodic webhook updates
+local Stats = {
+    AttacksAttempted = 0,
+    AttacksAborted = 0,
+    MatchesCompleted = 0,
+    Rebirths = 0,
+    StartTime = tick(),
+}
 
 local WEBHOOK = "https://discord.com/api/webhooks/1503794681803440321/qXasXkOVlDvjunThkHMv-2FzXsyBB74yamzlWDgygmxPnHRJ2xWRRBu5FOdXKj99jaQS"
 local LOW_HP_THRESHOLD = 0.35
-local UNDERGROUND_Y = 10 -- studs below current position
-local ATTACK_OFFSET = 8 -- studs away from zombie horizontally
+local UNDERGROUND_Y = 10
+local ATTACK_OFFSET = 8
+local MAX_ZOMBIE_RANGE = 400 -- skip glitched/out-of-bounds zombies
+local ATTACK_COOLDOWN_PER_ZOMBIE = 1.0 -- avoid re-targeting same zombie for 1s
+local ATTACK_TIMEOUT = 5 -- if attack runs longer than this, force unstick
+local STATS_INTERVAL = 1800 -- send stats every 30 mins
 
--- Rebirth steps from Rebirth.lua
+-- Recently attacked zombies cooldown
+local RecentlyAttacked = {}
+
 local REBIRTH_STEPS = {
     { RequiredLevel = 50, CoinsRequired = 2500000 },
     { RequiredLevel = 50, CoinsRequired = 5000000 },
@@ -72,7 +90,14 @@ UserInputService.InputBegan:Connect(function(Input, GameProcessed)
     end
 end)
 
--- Helpers
+-- Character validity check
+local function IsCharValid()
+    return Character and Character.Parent
+        and Humanoid and Humanoid.Parent and Humanoid.Health > 0
+        and HRP and HRP.Parent
+end
+
+-- Player data
 local function GetData()
     local Data = LocalPlayer:FindFirstChild("Data")
     if not Data then return nil end
@@ -115,63 +140,82 @@ local function GetAbilityInfo()
     return nil, nil
 end
 
--- Find nearest alive zombie - validates Config.Health > 0 and parent still in workspace.Zombies
-local function GetNearestZombie()
-    local ZombieFolder = workspace:FindFirstChild("Zombies")
-    if not ZombieFolder then return nil, nil end
+-- Canonical zombie validity (mirrors game's Utils.IsValidChar)
+local function IsZombieValid(Model)
+    if not Model or not Model.Parent then return false end
+    if not Model:IsA("Model") then return false end
 
-    local Nearest, NearestRoot, NearestDist = nil, nil, math.huge
+    local ZombieFolder = workspace:FindFirstChild("Zombies")
+    if not ZombieFolder or not Model:IsDescendantOf(ZombieFolder) then return false end
+
+    -- "Died" attribute - game sets this on dead chars
+    if Model:GetAttribute("Died") then return false end
+
+    -- HRP is removed when zombie dies
+    local Root = Model:FindFirstChild("HumanoidRootPart")
+    if not Root or not Root.Parent then return false end
+
+    -- Humanoid health
+    local Hum = Model:FindFirstChildWhichIsA("Humanoid")
+    if Hum and Hum.Health <= 0 then return false end
+
+    -- Server-side Config.Health
+    local Config = Model:FindFirstChild("Config")
+    if Config then
+        local Health = Config:FindFirstChild("Health")
+        if Health and Health.Value <= 0 then return false end
+    end
+
+    return true
+end
+
+-- Find nearest valid zombie, respecting cooldown and max range
+local function GetNearestZombie()
+    if not IsCharValid() then return nil end
+
+    local ZombieFolder = workspace:FindFirstChild("Zombies")
+    if not ZombieFolder then return nil end
+
+    local Nearest, NearestDist = nil, math.huge
+    local Now = tick()
 
     for _, Model in ipairs(ZombieFolder:GetChildren()) do
-        if not Model.Parent then continue end
+        if not IsZombieValid(Model) then continue end
+        if RecentlyAttacked[Model] and RecentlyAttacked[Model] > Now then continue end
 
-        -- Check real health via Config.Health
-        local Config = Model:FindFirstChild("Config")
-        local HealthVal = Config and Config:FindFirstChild("Health")
-        if HealthVal and HealthVal.Value <= 0 then continue end
-
-        local Root = Model:FindFirstChild("HumanoidRootPart") or Model.PrimaryPart or Model:FindFirstChildWhichIsA("BasePart")
+        local Root = Model:FindFirstChild("HumanoidRootPart")
         if not Root then continue end
 
-        -- Use XZ distance only since we may be underground
         local Dx = Root.Position.X - HRP.Position.X
         local Dz = Root.Position.Z - HRP.Position.Z
         local Dist = math.sqrt(Dx * Dx + Dz * Dz)
 
+        if Dist > MAX_ZOMBIE_RANGE then continue end
+
         if Dist < NearestDist then
             Nearest = Model
-            NearestRoot = Root
             NearestDist = Dist
         end
     end
 
-    return Nearest, NearestRoot
+    return Nearest
 end
 
--- Validate a zombie model is still alive right now
-local function IsZombieAlive(Model)
-    if not Model or not Model.Parent then return false end
-    local ZombieFolder = workspace:FindFirstChild("Zombies")
-    if not ZombieFolder or not Model:IsDescendantOf(ZombieFolder) then return false end
-    local Config = Model:FindFirstChild("Config")
-    local HealthVal = Config and Config:FindFirstChild("Health")
-    if HealthVal and HealthVal.Value <= 0 then return false end
-    return true
-end
-
--- TP underground (safe zone)
+-- Movement primitives
 local function GoUnderground()
-    if HRP and HRP.Parent then
-        HRP.CFrame = CFrame.new(HRP.Position.X, HRP.Position.Y - UNDERGROUND_Y, HRP.Position.Z)
-    end
+    if not IsCharValid() then return end
+    HRP.CFrame = CFrame.new(HRP.Position.X, HRP.Position.Y - UNDERGROUND_Y, HRP.Position.Z)
 end
 
--- TP to attack position near zombie (offset so we're not inside it)
 local function GoToZombie(ZombieRoot)
-    if not HRP or not HRP.Parent then return end
+    if not IsCharValid() then return end
+    if not ZombieRoot or not ZombieRoot.Parent then return end
     local ZPos = ZombieRoot.Position
-    local Offset = (HRP.Position - ZPos).Unit * ATTACK_OFFSET
-    Offset = Vector3.new(Offset.X, 0, Offset.Z)
+    local Dir = HRP.Position - ZPos
+    if Dir.Magnitude < 0.1 then
+        Dir = Vector3.new(1, 0, 0)
+    end
+    local Offset = Vector3.new(Dir.X, 0, Dir.Z).Unit * ATTACK_OFFSET
     HRP.CFrame = CFrame.new(ZPos + Offset + Vector3.new(0, 2, 0))
 end
 
@@ -181,7 +225,7 @@ RunService.Heartbeat:Connect(function()
     LowHP = (Humanoid.Health / math.max(Humanoid.MaxHealth, 1)) < LOW_HP_THRESHOLD
 end)
 
--- Noclip every frame
+-- Noclip
 RunService.Stepped:Connect(function()
     if not Running then return end
     if not Character or not Character.Parent then return end
@@ -194,12 +238,36 @@ RunService.Stepped:Connect(function()
     end)
 end)
 
--- Main attack loop - underground hit and run
+-- Cleanup RecentlyAttacked + watchdog for stuck Attacking flag
+task.spawn(function()
+    while true do
+        task.wait(1)
+
+        local Now = tick()
+
+        -- Clean expired entries and garbage-collected models
+        for Model, Expiry in pairs(RecentlyAttacked) do
+            if not Model.Parent or Expiry < Now then
+                RecentlyAttacked[Model] = nil
+            end
+        end
+
+        -- Force unstick if attacking too long
+        if Attacking and (Now - AttackStartTime) > ATTACK_TIMEOUT then
+            print("[StoryFarm] Attack stuck for " .. math.floor(Now - AttackStartTime) .. "s, force releasing")
+            Attacking = false
+            Safe("ForceUnstuck", GoUnderground)
+        end
+    end
+end)
+
+-- Main attack loop
 task.spawn(function()
     while true do
         task.wait(0.1)
         if not Running then continue end
         if Attacking then continue end
+        if not IsCharValid() then task.wait(1) continue end
 
         Safe("AttackLoop", function()
             local Interact = GetInteract()
@@ -208,62 +276,72 @@ task.spawn(function()
             local SlotName, AbilityName = GetAbilityInfo()
             if not SlotName or not AbilityName then task.wait(1) return end
 
-            -- If low HP, go underground and wait it out
+            -- Low HP retreat
             if LowHP then
-                print("[StoryFarm] Low HP, retreating underground...")
                 GoUnderground()
-                task.wait(3)
+                task.wait(2.5)
                 return
             end
 
-            local ZombieModel, ZombieRoot = GetNearestZombie()
-            if not ZombieModel or not ZombieRoot then
-                print("[StoryFarm] No zombies found, waiting...")
-                task.wait(2)
+            local ZombieModel = GetNearestZombie()
+            if not ZombieModel then
+                task.wait(1)
                 return
             end
 
+            -- Mark as attacking BEFORE TP so watchdog can unstick if needed
             Attacking = true
+            AttackStartTime = tick()
+            Stats.AttacksAttempted = Stats.AttacksAttempted + 1
 
-            -- 1. Go underground
-            GoUnderground()
-            task.wait(0.1)
-
-            -- 2. Re-validate zombie is STILL alive after going underground
-            if not IsZombieAlive(ZombieModel) then
-                print("[StoryFarm] Zombie died mid-approach, finding new target...")
+            -- Pre-TP final validation
+            if not IsZombieValid(ZombieModel) then
+                Stats.AttacksAborted = Stats.AttacksAborted + 1
                 Attacking = false
                 return
             end
 
-            -- 3. Re-get root in case it changed
-            ZombieRoot = ZombieModel:FindFirstChild("HumanoidRootPart") or ZombieModel.PrimaryPart or ZombieModel:FindFirstChildWhichIsA("BasePart")
-            if not ZombieRoot then
+            local ZombieRoot = ZombieModel:FindFirstChild("HumanoidRootPart")
+            if not ZombieRoot or not ZombieRoot.Parent then
+                Stats.AttacksAborted = Stats.AttacksAborted + 1
                 Attacking = false
                 return
             end
 
-            -- 4. Surface and attack
+            -- Cooldown this zombie immediately so we don't loop on it
+            RecentlyAttacked[ZombieModel] = tick() + ATTACK_COOLDOWN_PER_ZOMBIE
+
+            -- TP up to attack position
             GoToZombie(ZombieRoot)
-            task.wait(0.05)
+            task.wait(0.03)
 
-            for i = 1, 4 do
-                Interact:FireServer("Ability", i, SlotName, AbilityName, "Began")
-                task.wait(0.05)
-                Interact:FireServer("Ability", i, SlotName, AbilityName, "Released")
-                task.wait(0.05)
+            -- One last validation before firing (zombie could have died in those 30ms)
+            if not IsZombieValid(ZombieModel) then
+                Stats.AttacksAborted = Stats.AttacksAborted + 1
+                GoUnderground()
+                Attacking = false
+                return
             end
 
-            -- 5. Back underground immediately
+            -- Fire all 4 abilities fast
+            for i = 1, 4 do
+                if not IsCharValid() then break end
+                Interact:FireServer("Ability", i, SlotName, AbilityName, "Began")
+                task.wait(0.03)
+                Interact:FireServer("Ability", i, SlotName, AbilityName, "Released")
+                task.wait(0.03)
+            end
+
+            -- Retreat immediately
             GoUnderground()
-            task.wait(0.5)
+            task.wait(0.25)
 
             Attacking = false
         end)
     end
 end)
 
--- Auto rebirth check every 10s
+-- Auto rebirth check
 task.spawn(function()
     while true do
         task.wait(10)
@@ -278,6 +356,7 @@ task.spawn(function()
 
             print("[StoryFarm] Rebirthing! Rebirths: " .. Data.Rebirths .. " Level: " .. Data.Level)
             Interact:FireServer("Rebirth")
+            Stats.Rebirths = Stats.Rebirths + 1
 
             SendWebhook("Rebirth Performed!", {
                 { name = "Rebirths", value = tostring(Data.Rebirths + 1), inline = true },
@@ -288,7 +367,7 @@ task.spawn(function()
     end
 end)
 
--- End screen - send current coins/level/rebirths, then retry
+-- End screen handler
 task.spawn(function()
     Safe("EndScreenWatcher", function()
         local HUD = LocalPlayer.PlayerGui:WaitForChild("HUD")
@@ -299,7 +378,7 @@ task.spawn(function()
 
             Safe("EndScreenFired", function()
                 local Data = GetData()
-                print("[StoryFarm] Match ended, sending stats...")
+                Stats.MatchesCompleted = Stats.MatchesCompleted + 1
 
                 SendWebhook("Match Over", {
                     { name = "Coins",    value = Data and tostring(Data.Coins)    or "?", inline = true },
@@ -310,10 +389,7 @@ task.spawn(function()
                 if Running then
                     task.wait(0.5)
                     local Interact = GetInteract()
-                    if Interact then
-                        print("[StoryFarm] Firing PlayAgain")
-                        Interact:FireServer("PlayAgain")
-                    end
+                    if Interact then Interact:FireServer("PlayAgain") end
                 end
             end)
         end)
@@ -322,7 +398,7 @@ task.spawn(function()
     end)
 end)
 
--- Auto start raid vote
+-- Auto start raid
 task.spawn(function()
     Safe("StartWatcher", function()
         local function FireStart()
@@ -331,7 +407,6 @@ task.spawn(function()
             Safe("FireVoteSkipRaid", function()
                 local Interact = GetInteract()
                 if not Interact then return end
-                print("[StoryFarm] Voting to start")
                 task.wait(0.5)
                 Interact:FireServer("VoteSkipRaid")
             end)
@@ -344,7 +419,31 @@ task.spawn(function()
     end)
 end)
 
--- CharacterAdded - re-grab all refs on respawn
+-- Periodic stats webhook (so user knows it's still running overnight)
+task.spawn(function()
+    while true do
+        task.wait(STATS_INTERVAL)
+        if not Running then continue end
+
+        Safe("StatsReport", function()
+            local Data = GetData()
+            local Runtime = math.floor((tick() - Stats.StartTime) / 60)
+
+            SendWebhook("Status Report", {
+                { name = "Runtime",         value = Runtime .. " min",                       inline = true },
+                { name = "Matches",         value = tostring(Stats.MatchesCompleted),        inline = true },
+                { name = "Rebirths",        value = tostring(Stats.Rebirths),                inline = true },
+                { name = "Attacks",         value = tostring(Stats.AttacksAttempted),        inline = true },
+                { name = "Aborted",         value = tostring(Stats.AttacksAborted),          inline = true },
+                { name = "Coins",           value = Data and tostring(Data.Coins)    or "?", inline = true },
+                { name = "Level",           value = Data and tostring(Data.Level)    or "?", inline = true },
+                { name = "Current Rebirth", value = Data and tostring(Data.Rebirths) or "?", inline = true },
+            }, 7506394)
+        end)
+    end
+end)
+
+-- CharacterAdded - re-grab refs and reset state on respawn
 LocalPlayer.CharacterAdded:Connect(function(NewCharacter)
     Safe("CharacterAdded", function()
         print("[StoryFarm] Character respawned")
@@ -356,14 +455,12 @@ LocalPlayer.CharacterAdded:Connect(function(NewCharacter)
 
         task.wait(1)
 
-        -- Break forcefield by nudging forward for 2s
         local ForceConn
         local Start = tick()
         ForceConn = RunService.Stepped:Connect(function()
             Safe("ForcefieldNudge", function()
                 if tick() - Start >= 2 then
                     ForceConn:Disconnect()
-                    print("[StoryFarm] Forcefield done")
                     return
                 end
                 if HRP and HRP.Parent then
@@ -372,9 +469,8 @@ LocalPlayer.CharacterAdded:Connect(function(NewCharacter)
             end)
         end)
 
-        -- Start underground immediately after forcefield
         task.wait(2.5)
-        GoUnderground()
-        print("[StoryFarm] Gone underground, starting attack loop")
+        Safe("InitialUnderground", GoUnderground)
+        print("[StoryFarm] Underground, attack loop active")
     end)
 end)
