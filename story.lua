@@ -115,24 +115,48 @@ local function GetAbilityInfo()
     return nil, nil
 end
 
--- Find nearest zombie in workspace.Zombies
+-- Find nearest alive zombie - validates Config.Health > 0 and parent still in workspace.Zombies
 local function GetNearestZombie()
     local ZombieFolder = workspace:FindFirstChild("Zombies")
-    if not ZombieFolder then return nil end
+    if not ZombieFolder then return nil, nil end
 
-    local Nearest, NearestDist = nil, math.huge
+    local Nearest, NearestRoot, NearestDist = nil, nil, math.huge
 
     for _, Model in ipairs(ZombieFolder:GetChildren()) do
-        local Root = Model.PrimaryPart or Model:FindFirstChildWhichIsA("BasePart")
+        if not Model.Parent then continue end
+
+        -- Check real health via Config.Health
+        local Config = Model:FindFirstChild("Config")
+        local HealthVal = Config and Config:FindFirstChild("Health")
+        if HealthVal and HealthVal.Value <= 0 then continue end
+
+        local Root = Model:FindFirstChild("HumanoidRootPart") or Model.PrimaryPart or Model:FindFirstChildWhichIsA("BasePart")
         if not Root then continue end
-        local Dist = (Root.Position - Vector3.new(HRP.Position.X, Root.Position.Y, HRP.Position.Z)).Magnitude
+
+        -- Use XZ distance only since we may be underground
+        local Dx = Root.Position.X - HRP.Position.X
+        local Dz = Root.Position.Z - HRP.Position.Z
+        local Dist = math.sqrt(Dx * Dx + Dz * Dz)
+
         if Dist < NearestDist then
-            Nearest = Root
+            Nearest = Model
+            NearestRoot = Root
             NearestDist = Dist
         end
     end
 
-    return Nearest
+    return Nearest, NearestRoot
+end
+
+-- Validate a zombie model is still alive right now
+local function IsZombieAlive(Model)
+    if not Model or not Model.Parent then return false end
+    local ZombieFolder = workspace:FindFirstChild("Zombies")
+    if not ZombieFolder or not Model:IsDescendantOf(ZombieFolder) then return false end
+    local Config = Model:FindFirstChild("Config")
+    local HealthVal = Config and Config:FindFirstChild("Health")
+    if HealthVal and HealthVal.Value <= 0 then return false end
+    return true
 end
 
 -- TP underground (safe zone)
@@ -192,8 +216,8 @@ task.spawn(function()
                 return
             end
 
-            local ZombieRoot = GetNearestZombie()
-            if not ZombieRoot then
+            local ZombieModel, ZombieRoot = GetNearestZombie()
+            if not ZombieModel or not ZombieRoot then
                 print("[StoryFarm] No zombies found, waiting...")
                 task.wait(2)
                 return
@@ -201,18 +225,28 @@ task.spawn(function()
 
             Attacking = true
 
-            -- 1. Re-validate zombie is still alive right before TPing
-            local ZombiesModel = workspace:FindFirstChild("Zombies")
-            if not ZombieRoot.Parent or not ZombieRoot.Parent:IsDescendantOf(ZombiesModel or workspace) then
-                print("[StoryFarm] Zombie died before we could attack, skipping...")
+            -- 1. Go underground
+            GoUnderground()
+            task.wait(0.1)
+
+            -- 2. Re-validate zombie is STILL alive after going underground
+            if not IsZombieAlive(ZombieModel) then
+                print("[StoryFarm] Zombie died mid-approach, finding new target...")
                 Attacking = false
                 return
             end
 
-            GoToZombie(ZombieRoot)
-            task.wait(0.1)
+            -- 3. Re-get root in case it changed
+            ZombieRoot = ZombieModel:FindFirstChild("HumanoidRootPart") or ZombieModel.PrimaryPart or ZombieModel:FindFirstChildWhichIsA("BasePart")
+            if not ZombieRoot then
+                Attacking = false
+                return
+            end
 
-            -- 2. Fire all abilities
+            -- 4. Surface and attack
+            GoToZombie(ZombieRoot)
+            task.wait(0.05)
+
             for i = 1, 4 do
                 Interact:FireServer("Ability", i, SlotName, AbilityName, "Began")
                 task.wait(0.05)
@@ -220,10 +254,8 @@ task.spawn(function()
                 task.wait(0.05)
             end
 
-            -- 3. Immediately go back underground
+            -- 5. Back underground immediately
             GoUnderground()
-
-            -- 4. Brief cooldown underground before next attack
             task.wait(0.5)
 
             Attacking = false
