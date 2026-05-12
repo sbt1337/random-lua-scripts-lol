@@ -201,7 +201,14 @@ task.spawn(function()
 
             Attacking = true
 
-            -- 1. Come up from underground to attack position
+            -- 1. Re-validate zombie is still alive right before TPing
+            local ZombiesModel = workspace:FindFirstChild("Zombies")
+            if not ZombieRoot.Parent or not ZombieRoot.Parent:IsDescendantOf(ZombiesModel or workspace) then
+                print("[StoryFarm] Zombie died before we could attack, skipping...")
+                Attacking = false
+                return
+            end
+
             GoToZombie(ZombieRoot)
             task.wait(0.1)
 
