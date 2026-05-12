@@ -27,7 +27,7 @@ local Stats = {
     StartTime = tick(),
 }
 
-local WEBHOOK = "https://discord.com/api/webhooks/1503794681803440321/qXasXkOVlDvjunThkHMv-2FzXsyBB74yamzlWDgygmxPnHRJ2xWRRBu5FOdXKj99jaQS"
+local WEBHOOK = "https://discord.com/api/webhooks/1503857688118034662/H3y9e9EUyyZyRnKCQ-X_eIdRpejU8OwStg22dzEoycfGt__iAhRTYmnumIenbFWEckS7"
 local LOW_HP_THRESHOLD = 0.35
 local UNDERGROUND_Y = 10
 local ATTACK_OFFSET = 8
