@@ -761,6 +761,74 @@ local function GetEscapePart()
     return nil
 end
 
+-- Escape ProximityPrompt scanner. Decompile has no ProximityPrompt scripts but the prompt
+-- may be authored directly in workspace.Map as a static instance — scan workspace descendants
+-- for any ProximityPrompt whose Name/ActionText/ObjectText contains "escape".
+local FireProx = fireproximityprompt
+    or (syn and syn.fireproximityprompt)
+    or (getgenv and getgenv().fireproximityprompt)
+
+local FiredEscapePrompts = setmetatable({}, { __mode = "k" }) -- weak keys so GC'd prompts drop
+
+local function IsEscapePrompt(Prompt)
+    if not Prompt:IsA("ProximityPrompt") then return false end
+    if not Prompt.Enabled then return false end
+    local Combined = string.lower(
+        (Prompt.Name       or "") .. " " ..
+        (Prompt.ActionText or "") .. " " ..
+        (Prompt.ObjectText or "")
+    )
+    return string.find(Combined, "escape", 1, true) ~= nil
+end
+
+local function FireEscapePrompt(Prompt)
+    if not Running then return end
+    if not Prompt or not Prompt.Parent then return end
+    if not IsEscapePrompt(Prompt) then return end
+    if FiredEscapePrompts[Prompt] and (tick() - FiredEscapePrompts[Prompt]) < 2 then return end
+
+    FiredEscapePrompts[Prompt] = tick()
+    print("[StoryFarm] Escape prompt: " .. Prompt.Name
+        .. " | action='" .. (Prompt.ActionText or "")
+        .. "' object='" .. (Prompt.ObjectText or "") .. "'")
+
+    if FireProx then
+        Safe("FireProx", function() FireProx(Prompt, 0) end)
+    else
+        -- Fallback: TP near it and let the player's own input handle it (rare path)
+        local Parent = Prompt.Parent
+        if Parent and Parent:IsA("BasePart") and IsCharValid() then
+            HRP.CFrame = Parent.CFrame + Vector3.new(0, 3, 0)
+        end
+    end
+end
+
+task.spawn(function()
+    Safe("EscapePromptScanner", function()
+        for _, Inst in ipairs(workspace:GetDescendants()) do
+            if Inst:IsA("ProximityPrompt") then FireEscapePrompt(Inst) end
+        end
+
+        workspace.DescendantAdded:Connect(function(Inst)
+            if Inst:IsA("ProximityPrompt") then
+                task.wait(0.05) -- let ActionText/ObjectText settle if they're set after parent
+                FireEscapePrompt(Inst)
+            end
+        end)
+
+        -- Continuous sweep in case a prompt gets re-enabled instead of re-created
+        while true do
+            task.wait(1)
+            if not Running then continue end
+            for _, Inst in ipairs(workspace:GetDescendants()) do
+                if Inst:IsA("ProximityPrompt") and IsEscapePrompt(Inst) then
+                    FireEscapePrompt(Inst)
+                end
+            end
+        end
+    end)
+end)
+
 -- Objective gate: only escape when workspace.Objectives has a visible child
 -- whose Name starts with "Escape" (e.g. "Escape Shibuya!", "Escape Impel Down!").
 -- Per ObjectivesPanel.lua:50 the objective name IS the displayed text.
