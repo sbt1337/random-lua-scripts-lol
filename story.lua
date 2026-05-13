@@ -342,20 +342,45 @@ task.spawn(function()
             -- Hard-reset: if zombies exist but we can't track any live ones for 10s+, dump diagnostics + wipe
             if InFolder > 0 and LiveTracked == 0 then
                 StuckSince = StuckSince or tick()
+                local StuckFor = math.floor(tick() - StuckSince)
                 print("[StoryFarm] Stuck: " .. InFolder .. " in folder, " .. Tracked
-                    .. " cached, " .. LiveTracked .. " live (" .. math.floor(tick() - StuckSince) .. "s)")
+                    .. " cached, " .. LiveTracked .. " live (" .. StuckFor .. "s)")
 
-                -- Per-zombie diagnostic on the first child so we can see what's wrong
+                -- Sample the first zombie so we can see what's wrong
                 local First = Folder:FindFirstChildOfClass("Model")
+                local CfgStr, HpStr, RootStr, DiedStr, ChildList = "?", "?", "?", "?", "?"
                 if First then
                     local Config = First:FindFirstChild("Config")
                     local Health = Config and Config:FindFirstChild("Health")
                     local Root = ResolveRoot(First)
-                    print("[StoryFarm] Sample '" .. First.Name .. "': Config="
-                        .. tostring(Config ~= nil) .. " Health="
-                        .. (Health and tostring(Health.Value) or "nil") .. " Root="
-                        .. (Root and Root.Name or "nil") .. " Died="
-                        .. tostring(First:GetAttribute("Died")))
+                    CfgStr  = tostring(Config ~= nil)
+                    HpStr   = Health and tostring(Health.Value) or "nil"
+                    RootStr = Root and Root.Name or "nil"
+                    DiedStr = tostring(First:GetAttribute("Died"))
+
+                    -- List first-level children so we can see actual model structure
+                    local Names = {}
+                    for _, C in ipairs(First:GetChildren()) do
+                        table.insert(Names, C.ClassName .. ":" .. C.Name)
+                        if #Names >= 8 then break end
+                    end
+                    ChildList = table.concat(Names, ", ")
+                end
+
+                -- Throttle webhook to once per 30s when stuck so we don't flood
+                if StuckFor % 30 == 0 then
+                    SendWebhook("Tracker Stuck", {
+                        { name = "Folder",   value = tostring(InFolder),    inline = true },
+                        { name = "Cached",   value = tostring(Tracked),     inline = true },
+                        { name = "Live",     value = tostring(LiveTracked), inline = true },
+                        { name = "StuckFor", value = StuckFor .. "s",       inline = true },
+                        { name = "Sample",   value = First and First.Name or "(none)", inline = false },
+                        { name = "Config",   value = CfgStr,  inline = true },
+                        { name = "Health",   value = HpStr,   inline = true },
+                        { name = "Root",     value = RootStr, inline = true },
+                        { name = "Died",     value = DiedStr, inline = true },
+                        { name = "Children", value = "```" .. ChildList .. "```", inline = false },
+                    }, 15158332)
                 end
 
                 if tick() - StuckSince >= 10 then
