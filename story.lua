@@ -327,15 +327,33 @@ task.spawn(function()
             end
             for _ in pairs(AliveZombies) do Tracked = Tracked + 1 end
 
-            -- Hard-reset: if zombies exist but we can't track any for 10s+, wipe cache and re-register everything
-            if InFolder > 0 and Tracked == 0 then
+            -- Diagnose: count how many cached entries are passing IsZombieDataLive
+            local LiveTracked = 0
+            for _, Data in pairs(AliveZombies) do
+                if IsZombieDataLive(Data) then LiveTracked = LiveTracked + 1 end
+            end
+
+            -- Hard-reset: if zombies exist but we can't track any live ones for 10s+, dump diagnostics + wipe
+            if InFolder > 0 and LiveTracked == 0 then
                 StuckSince = StuckSince or tick()
-                print("[StoryFarm] Rescan: " .. InFolder .. " zombies in folder but 0 tracked (stuck "
-                    .. math.floor(tick() - StuckSince) .. "s)")
+                print("[StoryFarm] Stuck: " .. InFolder .. " in folder, " .. Tracked
+                    .. " cached, " .. LiveTracked .. " live (" .. math.floor(tick() - StuckSince) .. "s)")
+
+                -- Per-zombie diagnostic on the first child so we can see what's wrong
+                local First = Folder:FindFirstChildOfClass("Model")
+                if First then
+                    local Config = First:FindFirstChild("Config")
+                    local Health = Config and Config:FindFirstChild("Health")
+                    local Root = ResolveRoot(First)
+                    print("[StoryFarm] Sample '" .. First.Name .. "': Config="
+                        .. tostring(Config ~= nil) .. " Health="
+                        .. (Health and tostring(Health.Value) or "nil") .. " Root="
+                        .. (Root and Root.Name or "nil") .. " Died="
+                        .. tostring(First:GetAttribute("Died")))
+                end
 
                 if tick() - StuckSince >= 10 then
                     print("[StoryFarm] HARD RESET zombie tracker")
-                    -- Detach + clear cache + force fresh AttachZombieFolder
                     for _, Conn in ipairs(ZombieFolderConns) do
                         pcall(function() Conn:Disconnect() end)
                     end
@@ -499,7 +517,7 @@ local function GoUnderZombie()
     -- Raycast straight down (filtering out alive entities) to find real ground.
     -- Then go UNDERGROUND_Y below ground level, not just below the zombie.
     RefreshRaycastFilter()
-    local Hit = workspace:Raycast(Pos + Vector3.new(0, 2, 0), Vector3.new(0, -500, 0), UnderRaycastParams)
+    local Hit = workspace:Raycast(Pos + Vector3.new(0, 50, 0), Vector3.new(0, -2000, 0), UnderRaycastParams)
     local TargetY
     if Hit then
         TargetY = Hit.Position.Y - UNDERGROUND_Y
@@ -627,6 +645,8 @@ local function PickAttackCenter(Target)
     return Best, BestCount
 end
 
+local LastAttackAt = tick() -- updated each time we fire an ability; used by stuck-recovery watchdog
+
 -- Main attack loop
 task.spawn(function()
     while true do
@@ -713,7 +733,7 @@ task.spawn(function()
             RefreshRaycastFilter()
             local FloorHit = workspace:Raycast(
                 Center + Vector3.new(0, 200, 0),
-                Vector3.new(0, -500, 0),
+                Vector3.new(0, -2000, 0),
                 UnderRaycastParams
             )
             local SurfaceY = FloorHit and (FloorHit.Position.Y + ATTACK_HEIGHT) or (Center.Y + ATTACK_HEIGHT)
@@ -757,6 +777,7 @@ task.spawn(function()
                 Interact:FireServer("Ability", Slot, SlotName, AbilityName, "Began")
                 task.wait(0.03)
                 Interact:FireServer("Ability", Slot, SlotName, AbilityName, "Released")
+                LastAttackAt = tick()
 
                 -- Soft cooldown until server confirms via UsedAbility (prevents same-slot spam if event is late)
                 if SlotCooldownEnd[Slot] <= tick() then
@@ -1200,6 +1221,34 @@ LocalPlayer.CharacterAdded:Connect(SetupCharacter)
 if Character and Character.Parent then
     task.spawn(SetupCharacter, Character)
 end
+
+-- Stuck-floating recovery: if we go >15s without a successful attack while a raid
+-- is active and zombies exist, TP to workspace.Map.SpawnPoint to unstick.
+task.spawn(function()
+    while true do
+        task.wait(2)
+        if not Running then continue end
+        if not IsCharValid() then continue end
+        if workspace:FindFirstChild("GameFinished") then continue end
+        if workspace:FindFirstChild("Cutscene") then continue end
+        if tick() - LastAttackAt < 15 then continue end
+
+        local Folder = workspace:FindFirstChild("Zombies")
+        if not Folder or #Folder:GetChildren() == 0 then continue end
+
+        Safe("StuckRecovery", function()
+            local Map = workspace:FindFirstChild("Map")
+            local Spawn = Map and Map:FindFirstChild("SpawnPoint")
+            if Spawn and Spawn:IsA("BasePart") then
+                print("[StoryFarm] Stuck floating for " .. math.floor(tick() - LastAttackAt)
+                    .. "s, TPing to SpawnPoint")
+                HRP.CFrame = Spawn.CFrame + Vector3.new(0, 3, 0)
+                HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                LastAttackAt = tick() -- give us time to recover before re-triggering
+            end
+        end)
+    end
+end)
 
 -- Last-resort target watchdog: if cache is empty and a raid is active, force a folder rescan
 task.spawn(function()
