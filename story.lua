@@ -815,20 +815,9 @@ task.spawn(function()
                 return
             end
 
-            -- Surface at ground+ATTACK_HEIGHT relative to the cluster's actual ground,
-            -- not the zombies' Y (which can be airborne in spawn rooms). Raycast down
-            -- from above the cluster to find the floor.
-            RefreshRaycastFilter()
-            local FloorHit = workspace:Raycast(
-                Center + Vector3.new(0, 200, 0),
-                Vector3.new(0, -2000, 0),
-                UnderRaycastParams
-            )
-            local SurfaceY = FloorHit and (FloorHit.Position.Y + ATTACK_HEIGHT) or (Center.Y + ATTACK_HEIGHT)
-
-            HRP.CFrame = CFrame.new(Center.X, SurfaceY, Center.Z)
-            HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-            task.wait(0.03)
+            -- Move horizontally under the cluster (stay underground for safety).
+            -- Picking the lowest-Y zombie via GoUnderZombie keeps us beneath real ground.
+            GoUnderZombie()
 
             if not IsZombieStillAlive(Target) and Hits <= 1 then
                 Stats.AttacksAborted = Stats.AttacksAborted + 1
