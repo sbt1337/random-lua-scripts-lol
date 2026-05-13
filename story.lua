@@ -18,6 +18,8 @@ local AttackStartTime = 0
 local CurrentTarget = nil
 local CurrentTargetIsBoss = false
 local SlotCooldownEnd = { 0, 0, 0, 0 } -- per-slot cooldown end time, set by UsedAbility event
+local LastDamageAt = 0
+local LastSeenHP = nil
 
 local Stats = {
     AttacksAttempted = 0,
@@ -37,7 +39,9 @@ local ATTACK_COOLDOWN_PER_ZOMBIE = 0.3 -- just enough for death events to propag
 local ATTACK_TIMEOUT = 4
 local STATS_INTERVAL = 1800
 local AOE_RADIUS = 12 -- assumed melee/AOE hitbox radius for cluster-picking
-local ATTACK_WINDOW = 1.5 -- max seconds we spend at the surface per cycle
+local ATTACK_WINDOW = 0.8 -- shorter surface window = less exposure
+local POST_DAMAGE_LOCKOUT = 1.5 -- stay underground this long after taking any hit
+local DAMAGE_ABORT_THRESHOLD = 1 -- HP drop in one tick that triggers immediate retreat
 
 -- Live caches updated by events (not polling)
 -- [Model] = { Root = HRP, Health = IntValue, Conns = {connections} }
@@ -578,6 +582,12 @@ task.spawn(function()
                 task.wait(0.1)
                 return
             end
+            -- Damage lockout: if we recently took a hit, stay underground
+            if tick() - LastDamageAt < POST_DAMAGE_LOCKOUT then
+                GoUnderZombie()
+                task.wait(0.1)
+                return
+            end
 
             local Target, IsBoss = PickNearestZombie()
             if not Target then
@@ -631,11 +641,22 @@ task.spawn(function()
                 return
             end
 
+            -- Snapshot HP before surfacing — any drop = abort and bail
+            local HPBefore = Humanoid and Humanoid.Health or 0
+            local DamageStart = LastDamageAt
+
             -- Cycle through ready slots (1..3) until window closes or all on CD
             local Deadline = tick() + ATTACK_WINDOW
             local Fired = 0
             while tick() < Deadline do
                 if not IsCharValid() then break end
+
+                -- Mid-attack damage abort
+                if LastDamageAt ~= DamageStart then break end
+                if Humanoid and (HPBefore - Humanoid.Health) >= DAMAGE_ABORT_THRESHOLD then
+                    LastDamageAt = tick()
+                    break
+                end
 
                 if IsActionBlocked() then
                     task.wait(0.03)
@@ -657,7 +678,7 @@ task.spawn(function()
                 task.wait(0.08)
             end
 
-            GoUnderground()
+            GoUnderZombie() -- back under the next target, not the (now-dead) cluster center
             task.wait(0.05)
             Attacking = false
         end)
@@ -1028,6 +1049,7 @@ local function WaitForForceField(Char, Timeout)
 end
 
 -- Apply to initial character too
+local HealthChangedConn = nil
 local function SetupCharacter(NewCharacter)
     Safe("SetupCharacter", function()
         print("[StoryFarm] Character ready")
@@ -1037,11 +1059,25 @@ local function SetupCharacter(NewCharacter)
         Attacking = false
         CurrentTarget = nil
         SlotCooldownEnd = { 0, 0, 0, 0 }
+        LastDamageAt = 0
+        LastSeenHP = nil
 
         if not Humanoid or not HRP then
             print("[StoryFarm] Missing Humanoid/HRP after spawn")
             return
         end
+
+        -- Damage tracker: any HP drop = mark damage, force retreat
+        if HealthChangedConn then
+            pcall(function() HealthChangedConn:Disconnect() end)
+        end
+        LastSeenHP = Humanoid.Health
+        HealthChangedConn = Humanoid.HealthChanged:Connect(function(NewHP)
+            if LastSeenHP and NewHP < LastSeenHP - 0.01 then
+                LastDamageAt = tick()
+            end
+            LastSeenHP = NewHP
+        end)
 
         -- Arm auto-revive (CanRevive attribute on Character)
         HookReviveListener(NewCharacter)
