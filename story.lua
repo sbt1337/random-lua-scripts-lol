@@ -671,42 +671,59 @@ task.spawn(function()
     end
 end)
 
--- End screen
+-- End-of-match: triggered when the server creates workspace.GameFinished
+-- (Create("GameFinished", "Folder", workspace) at _LocalFX.lua:15994).
+-- More reliable than watching UI properties since the folder is server-authoritative.
+local LastEndAt = 0
+local function HandleMatchEnd()
+    if tick() - LastEndAt < 5 then return end -- dedupe rapid double-fires
+    LastEndAt = tick()
+
+    Safe("EndScreenFired", function()
+        local Data = GetData()
+        local Match = GetMatchStats()
+        Stats.MatchesCompleted = Stats.MatchesCompleted + 1
+
+        local MatchKills  = (Match and type(Match.Kills)       == "number") and Match.Kills       or 0
+        local MatchDamage = (Match and type(Match.DamageDealt) == "number") and Match.DamageDealt or 0
+        Stats.TotalKills  = Stats.TotalKills  + MatchKills
+        Stats.TotalDamage = Stats.TotalDamage + MatchDamage
+
+        SendWebhook("Match Over", {
+            { name = "Coins",       value = Data and tostring(Data.Coins)    or "?", inline = true },
+            { name = "Level",       value = Data and tostring(Data.Level)    or "?", inline = true },
+            { name = "Rebirths",    value = Data and tostring(Data.Rebirths) or "?", inline = true },
+            { name = "Match Kills", value = tostring(MatchKills),                    inline = true },
+            { name = "Match Dmg",   value = tostring(MatchDamage),                   inline = true },
+            { name = "Total Kills", value = tostring(Stats.TotalKills),              inline = true },
+        }, 3066993)
+
+        if not Running then return end
+
+        -- Retry until the server actually accepts PlayAgain. We can't fully tell when the
+        -- new match has started, so just keep firing until GameFinished is gone.
+        local Deadline = tick() + 20
+        while tick() < Deadline do
+            if not workspace:FindFirstChild("GameFinished") then break end
+            local Interact = GetInteract()
+            if Interact then
+                Safe("FirePlayAgain", function() Interact:FireServer("PlayAgain") end)
+            end
+            task.wait(1)
+        end
+    end)
+end
+
 task.spawn(function()
     Safe("EndScreenWatcher", function()
-        local HUD = LocalPlayer.PlayerGui:WaitForChild("HUD")
-        local RetryButton = HUD:WaitForChild("EndScreen"):WaitForChild("Main"):WaitForChild("Retry")
+        local Existing = workspace:FindFirstChild("GameFinished")
+        if Existing then HandleMatchEnd() end
 
-        RetryButton:GetPropertyChangedSignal("Visible"):Connect(function()
-            if not RetryButton.Visible then return end
-            Safe("EndScreenFired", function()
-                local Data = GetData()
-                local Match = GetMatchStats()
-                Stats.MatchesCompleted = Stats.MatchesCompleted + 1
-
-                local MatchKills  = (Match and type(Match.Kills)       == "number") and Match.Kills       or 0
-                local MatchDamage = (Match and type(Match.DamageDealt) == "number") and Match.DamageDealt or 0
-                Stats.TotalKills  = Stats.TotalKills  + MatchKills
-                Stats.TotalDamage = Stats.TotalDamage + MatchDamage
-
-                SendWebhook("Match Over", {
-                    { name = "Coins",       value = Data and tostring(Data.Coins)    or "?", inline = true },
-                    { name = "Level",       value = Data and tostring(Data.Level)    or "?", inline = true },
-                    { name = "Rebirths",    value = Data and tostring(Data.Rebirths) or "?", inline = true },
-                    { name = "Match Kills", value = tostring(MatchKills),                    inline = true },
-                    { name = "Match Dmg",   value = tostring(MatchDamage),                   inline = true },
-                    { name = "Total Kills", value = tostring(Stats.TotalKills),              inline = true },
-                }, 3066993)
-
-                if Running then
-                    task.wait(0.5)
-                    local Interact = GetInteract()
-                    if Interact then Interact:FireServer("PlayAgain") end
-                end
-            end)
+        workspace.ChildAdded:Connect(function(Child)
+            if Child.Name == "GameFinished" then HandleMatchEnd() end
         end)
 
-        print("[StoryFarm] Watching for EndScreen...")
+        print("[StoryFarm] Watching workspace.GameFinished...")
     end)
 end)
 
