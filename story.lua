@@ -330,11 +330,14 @@ end
 
 -- Models we've tried to register and failed on — don't re-spam every rescan tick.
 local FailedRegister = setmetatable({}, { __mode = "k" })
+-- Models currently being processed (15s health wait in flight) — dedup concurrent attempts.
+local RegisterInProgress = setmetatable({}, { __mode = "k" })
 
 local function Register(Cache, Model, OnDeath)
     if not Model:IsA("Model") then return end
     if Cache[Model] then return end
-    if FailedRegister[Model] then return end -- already tried, gave up
+    if FailedRegister[Model] then return end
+    if RegisterInProgress[Model] then return end -- another rescan tick is already trying
 
     -- Boss tag check (called repeatedly inside the retry loop since the server tags bosses a few seconds after parenting)
     local function IsTaggedBoss()
@@ -347,6 +350,7 @@ local function Register(Cache, Model, OnDeath)
 
     if IsTaggedBoss() then return end
 
+    RegisterInProgress[Model] = true
     task.spawn(function()
         Safe("Register", function()
             -- Wait up to 15s for descendants to populate (game's own UI uses 10s; we go a bit higher).
@@ -420,6 +424,7 @@ local function Register(Cache, Model, OnDeath)
 
             Cache[Model] = { Model = Model, Root = Root, Health = Health, GetHealth = GetHealth, IsAlive = IsAlive, Conns = Conns }
         end)
+        RegisterInProgress[Model] = nil
     end)
 end
 
