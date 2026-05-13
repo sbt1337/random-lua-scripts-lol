@@ -13,9 +13,10 @@ local Humanoid = Character:WaitForChild("Humanoid")
 local HRP = Character:WaitForChild("HumanoidRootPart")
 
 local Running = true
-local LowHP = false
 local Attacking = false
 local AttackStartTime = 0
+local CurrentTarget = nil
+local CurrentTargetIsBoss = false
 
 local Stats = {
     AttacksAttempted = 0,
@@ -26,9 +27,8 @@ local Stats = {
 }
 
 local WEBHOOK = "https://discord.com/api/webhooks/1503857688118034662/H3y9e9EUyyZyRnKCQ-X_eIdRpejU8OwStg22dzEoycfGt__iAhRTYmnumIenbFWEckS7"
-local LOW_HP_THRESHOLD = 0.35
 local UNDERGROUND_Y = 10
-local ATTACK_OFFSET = 8
+local ATTACK_HEIGHT = 5
 local MAX_ZOMBIE_RANGE = 400
 local ATTACK_COOLDOWN_PER_ZOMBIE = 0.3 -- just enough for death events to propagate
 local ATTACK_TIMEOUT = 4
@@ -332,18 +332,8 @@ end
 local function GoToZombie(Root)
     if not IsCharValid() then return end
     if not Root or not Root.Parent then return end
-    local ZPos = Root.Position
-    local Dir = HRP.Position - ZPos
-    if Dir.Magnitude < 0.1 then Dir = Vector3.new(1, 0, 0) end
-    local Offset = Vector3.new(Dir.X, 0, Dir.Z).Unit * ATTACK_OFFSET
-    HRP.CFrame = CFrame.new(ZPos + Offset + Vector3.new(0, 2, 0))
+    HRP.CFrame = CFrame.new(Root.Position + Vector3.new(0, ATTACK_HEIGHT, 0))
 end
-
--- HP tracker
-RunService.Heartbeat:Connect(function()
-    if not Humanoid or not Humanoid.Parent then return end
-    LowHP = (Humanoid.Health / math.max(Humanoid.MaxHealth, 1)) < LOW_HP_THRESHOLD
-end)
 
 -- Noclip
 RunService.Stepped:Connect(function()
@@ -399,12 +389,6 @@ task.spawn(function()
             local SlotName, AbilityName = GetAbilityInfo()
             if not SlotName or not AbilityName then task.wait(0.5) return end
 
-            if LowHP then
-                GoUnderground()
-                task.wait(2)
-                return
-            end
-
             local Target, IsBoss = PickNearestZombie()
             if not Target then
                 task.wait(0.3)
@@ -432,6 +416,8 @@ task.spawn(function()
 
             if IsBoss then print("[StoryFarm] Boss target acquired: " .. Target.Name) end
 
+            CurrentTarget = Target
+            CurrentTargetIsBoss = IsBoss
             RecentlyAttacked[Target] = tick() + ATTACK_COOLDOWN_PER_ZOMBIE
 
             GoToZombie(Root)
@@ -445,8 +431,8 @@ task.spawn(function()
                 return
             end
 
-            -- Fire abilities, checking ActionCheck between each so we don't waste fires
-            for i = 1, 4 do
+            -- Fire abilities (skip slot 4 / V), checking ActionCheck between each
+            for i = 1, 3 do
                 if not IsCharValid() then break end
                 if not IsZombieStillAlive(Target) then break end
 
@@ -578,6 +564,38 @@ task.spawn(function()
     end
 end)
 
+-- Current target ping (every 5s)
+task.spawn(function()
+    while true do
+        task.wait(5)
+        if not Running then continue end
+
+        Safe("CurrentTargetPing", function()
+            local Target = CurrentTarget
+            if not Target or not Target.Parent then
+                SendWebhook("Current Target", {
+                    { name = "Target", value = "(none)", inline = true },
+                }, 10070709)
+                return
+            end
+
+            local Data = GetTargetEntry(Target)
+            local HP = Data and Data.Health and Data.Health.Value or "?"
+            local Dist = "?"
+            if Data and Data.Root and Data.Root.Parent and HRP and HRP.Parent then
+                Dist = tostring(math.floor((Data.Root.Position - HRP.Position).Magnitude))
+            end
+
+            SendWebhook("Current Target", {
+                { name = "Name",     value = Target.Name,                      inline = true },
+                { name = "Type",     value = CurrentTargetIsBoss and "BOSS" or "Zombie", inline = true },
+                { name = "HP",       value = tostring(HP),                     inline = true },
+                { name = "Distance", value = Dist,                             inline = true },
+            }, CurrentTargetIsBoss and 15158332 or 3447003)
+        end)
+    end
+end)
+
 -- CharacterAdded
 LocalPlayer.CharacterAdded:Connect(function(NewCharacter)
     Safe("CharacterAdded", function()
@@ -585,7 +603,6 @@ LocalPlayer.CharacterAdded:Connect(function(NewCharacter)
         Character = NewCharacter
         Humanoid = NewCharacter:WaitForChild("Humanoid")
         HRP = NewCharacter:WaitForChild("HumanoidRootPart")
-        LowHP = false
         Attacking = false
 
         task.wait(1)
