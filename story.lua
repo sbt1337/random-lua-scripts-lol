@@ -465,28 +465,10 @@ task.spawn(function()
     end)
 end)
 
--- Bootstrap bosses (CollectionService tagged "RaidBoss" or "Boss" with IsRaidBoss=true)
-task.spawn(function()
-    local function HandleBoss(Model)
-        Register(AliveBosses, Model, UnregisterBoss)
-    end
-
-    for _, Boss in ipairs(CollectionService:GetTagged("RaidBoss")) do
-        HandleBoss(Boss)
-    end
-    for _, Boss in ipairs(CollectionService:GetTagged("Boss")) do
-        if Boss:GetAttribute("IsRaidBoss") then HandleBoss(Boss) end
-    end
-
-    CollectionService:GetInstanceAddedSignal("RaidBoss"):Connect(HandleBoss)
-    CollectionService:GetInstanceAddedSignal("Boss"):Connect(function(Boss)
-        if Boss:GetAttribute("IsRaidBoss") then HandleBoss(Boss) end
-    end)
-    CollectionService:GetInstanceRemovedSignal("RaidBoss"):Connect(UnregisterBoss)
-    CollectionService:GetInstanceRemovedSignal("Boss"):Connect(UnregisterBoss)
-
-    print("[StoryFarm] Boss tracker active")
-end)
+-- Boss tracker disabled - bosses (Yuji, Upper Moon 3, Akaza) caused instability.
+-- AliveBosses stays empty so all iterations over it are no-ops. The tag-skip in
+-- Register() still rejects tagged bosses from the zombie tracker, so they're just ignored.
+print("[StoryFarm] Boss tracker disabled")
 
 -- Scan a cache for the nearest valid target
 -- IgnoreCooldown=true forces selection even from recently-attacked (used as fallback when nothing else available)
