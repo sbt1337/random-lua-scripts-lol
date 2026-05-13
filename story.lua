@@ -211,21 +211,75 @@ local function ResolveRoot(Model)
         or Model:FindFirstChildWhichIsA("BasePart")
 end
 
+-- Find a Health value anywhere in the model. Most zombies use Config.Health (IntValue/NumberValue).
+-- Bosses (e.g. "Upper Moon 3") have different layouts — check Model.Health, Configuration children,
+-- and Humanoid.Health as fallbacks.
+local function ResolveHealth(Model)
+    local Config = Model:FindFirstChild("Config")
+    if Config then
+        local H = Config:FindFirstChild("Health")
+        if H and (H:IsA("IntValue") or H:IsA("NumberValue")) then return H, "Config.Health" end
+    end
+
+    local Direct = Model:FindFirstChild("Health")
+    if Direct and (Direct:IsA("IntValue") or Direct:IsA("NumberValue")) then return Direct, "Health" end
+
+    -- Search shallow descendants for any IntValue/NumberValue named Health
+    for _, Child in ipairs(Model:GetDescendants()) do
+        if (Child:IsA("IntValue") or Child:IsA("NumberValue")) and Child.Name == "Health" then
+            return Child, Child:GetFullName()
+        end
+    end
+
+    -- Fall back to Humanoid.Health (standard Roblox)
+    local Hum = Model:FindFirstChildOfClass("Humanoid")
+    if Hum then return Hum, "Humanoid.Health" end
+
+    return nil
+end
+
+-- Models we've tried to register and failed on — don't re-spam every rescan tick.
+local FailedRegister = setmetatable({}, { __mode = "k" })
+
 local function Register(Cache, Model, OnDeath)
     if not Model:IsA("Model") then return end
     if Cache[Model] then return end
+    if FailedRegister[Model] then return end -- already tried, gave up
+
+    -- Don't double-register: if this model is already tracked in the OTHER cache (boss vs zombie), skip.
+    -- Bosses (CollectionService tagged "RaidBoss"/"Boss") show up in workspace.Zombies too — the boss
+    -- tracker handles them via tags, so the zombie tracker should ignore them.
+    if Cache == AliveZombies then
+        if AliveBosses[Model] then return end
+        if CollectionService:HasTag(Model, "RaidBoss") then return end
+        if CollectionService:HasTag(Model, "Boss") and Model:GetAttribute("IsRaidBoss") then return end
+    end
 
     task.spawn(function()
         Safe("Register", function()
-            local Config = Model:WaitForChild("Config", 10)
-            if not Config or not Model.Parent then
-                print("[StoryFarm] Register: no Config on " .. Model.Name)
-                return
+            -- Wait briefly for descendants to populate
+            local Health, HealthPath = ResolveHealth(Model)
+            if not Health then
+                local Deadline = tick() + 8
+                while not Health and tick() < Deadline and Model.Parent do
+                    task.wait(0.1)
+                    Health, HealthPath = ResolveHealth(Model)
+                end
             end
 
-            local Health = Config:WaitForChild("Health", 10)
-            if not Health or not Model.Parent then
-                print("[StoryFarm] Register: no Config.Health on " .. Model.Name)
+            if not Health then
+                FailedRegister[Model] = tick()
+                -- Send a one-shot webhook so we can see the unknown structure
+                local Names = {}
+                for _, C in ipairs(Model:GetChildren()) do
+                    table.insert(Names, C.ClassName .. ":" .. C.Name)
+                    if #Names >= 12 then break end
+                end
+                SendWebhook("Unknown enemy structure", {
+                    { name = "Model",    value = Model.Name,                 inline = true },
+                    { name = "Children", value = "```" .. table.concat(Names, ", ") .. "```", inline = false },
+                }, 15105570)
+                print("[StoryFarm] Register: no Health found on " .. Model.Name .. " (blacklisted)")
                 return
             end
 
@@ -243,14 +297,22 @@ local function Register(Cache, Model, OnDeath)
             end
 
             -- Don't bail on Health=0 / Died=true at register time. Server may set HP a frame
-            -- after spawn, or recycle models with stale flags. Just register the model;
-            -- ScanCache filters live/dead via IsZombieDataLive each tick, so dead zombies
-            -- in the cache are harmless and the death listeners clean them up.
+            -- after spawn, or recycle models with stale flags. ScanCache filters via IsZombieDataLive.
             local Conns = {}
+            local IsHumanoid = Health:IsA("Humanoid")
+            local GetHealth = IsHumanoid
+                and function() return Health.Health end
+                or  function() return Health.Value end
 
-            table.insert(Conns, Health:GetPropertyChangedSignal("Value"):Connect(function()
-                if Health.Value <= 0 then OnDeath(Model) end
-            end))
+            if IsHumanoid then
+                table.insert(Conns, Health.HealthChanged:Connect(function(NewHP)
+                    if NewHP <= 0 then OnDeath(Model) end
+                end))
+            else
+                table.insert(Conns, Health:GetPropertyChangedSignal("Value"):Connect(function()
+                    if Health.Value <= 0 then OnDeath(Model) end
+                end))
+            end
 
             table.insert(Conns, Model:GetAttributeChangedSignal("Died"):Connect(function()
                 if Model:GetAttribute("Died") then OnDeath(Model) end
@@ -264,7 +326,7 @@ local function Register(Cache, Model, OnDeath)
                 if not Model.Parent then OnDeath(Model) end
             end))
 
-            Cache[Model] = { Root = Root, Health = Health, Conns = Conns }
+            Cache[Model] = { Root = Root, Health = Health, GetHealth = GetHealth, Conns = Conns }
         end)
     end)
 end
@@ -272,7 +334,8 @@ end
 local function IsZombieDataLive(Data)
     if not Data or not Data.Root or not Data.Root.Parent then return false end
     if not Data.Health or not Data.Health.Parent then return false end
-    return Data.Health.Value > 0
+    if not Data.GetHealth then return false end
+    return Data.GetHealth() > 0
 end
 
 -- Bootstrap zombies (survives Zombies folder being destroyed/replaced between matches)
@@ -437,7 +500,7 @@ local function ScanCache(Cache, Unregister, IgnoreCooldown)
 
     for Model, Data in pairs(Cache) do
         if not Model.Parent then Unregister(Model) continue end
-        if Data.Health.Value <= 0 then Unregister(Model) continue end
+        if Data.GetHealth() <= 0 then Unregister(Model) continue end
         if not Data.Root or not Data.Root.Parent then Unregister(Model) continue end
         if Model:GetAttribute("Died") then Unregister(Model) continue end
         if Model:GetAttribute("Frozen") then continue end
@@ -484,7 +547,7 @@ local function IsZombieStillAlive(Model)
     local Data = GetTargetEntry(Model)
     if not Data then return false end
     if not Model.Parent then return false end
-    if Data.Health.Value <= 0 then return false end
+    if Data.GetHealth() <= 0 then return false end
     if not Data.Root or not Data.Root.Parent then return false end
     if Model:GetAttribute("Died") then return false end
     return true
@@ -1155,7 +1218,7 @@ task.spawn(function()
             end
 
             local Data = GetTargetEntry(Target)
-            local HP = Data and Data.Health and Data.Health.Value or "?"
+            local HP = (Data and Data.GetHealth) and tostring(Data.GetHealth()) or "?"
             local Dist = "?"
             if Data and Data.Root and Data.Root.Parent and HRP and HRP.Parent then
                 Dist = tostring(math.floor((Data.Root.Position - HRP.Position).Magnitude))
