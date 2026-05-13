@@ -12,6 +12,18 @@ local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
 local Humanoid = Character:WaitForChild("Humanoid")
 local HRP = Character:WaitForChild("HumanoidRootPart")
 
+-- Anti-AFK: Roblox kicks after ~20 minutes of no input. Hook Idled and simulate a click.
+do
+    local VirtualUser = game:GetService("VirtualUser")
+    LocalPlayer.Idled:Connect(function()
+        pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new())
+        end)
+        print("[StoryFarm] Anti-AFK: simulated input")
+    end)
+end
+
 local Running = true
 local Attacking = false
 local AttackStartTime = 0
@@ -230,9 +242,10 @@ local function Register(Cache, Model, OnDeath)
                 end
             end
 
-            if Health.Value <= 0 then return end
-            if Model:GetAttribute("Died") then return end
-
+            -- Don't bail on Health=0 / Died=true at register time. Server may set HP a frame
+            -- after spawn, or recycle models with stale flags. Just register the model;
+            -- ScanCache filters live/dead via IsZombieDataLive each tick, so dead zombies
+            -- in the cache are harmless and the death listeners clean them up.
             local Conns = {}
 
             table.insert(Conns, Health:GetPropertyChangedSignal("Value"):Connect(function()
@@ -293,27 +306,52 @@ task.spawn(function()
             if Child.Name == "Zombies" then AttachZombieFolder(Child) end
         end)
 
-        -- Periodic rescan + diagnostic (cheap safety net)
+        -- Aggressive periodic rescan + hard-reset if stuck
+        local StuckSince = nil
         while true do
-            task.wait(5)
+            task.wait(1.5)
             local Folder = workspace:FindFirstChild("Zombies")
             if Folder and Folder ~= CurrentZombieFolder then
                 AttachZombieFolder(Folder)
             end
-            if Folder then
-                local InFolder, Tracked = 0, 0
-                for _, Child in ipairs(Folder:GetChildren()) do
-                    if Child:IsA("Model") then
-                        InFolder = InFolder + 1
-                        if not AliveZombies[Child] then
-                            Register(AliveZombies, Child, UnregisterZombie)
-                        end
+            if not Folder then continue end
+
+            local InFolder, Tracked = 0, 0
+            for _, Child in ipairs(Folder:GetChildren()) do
+                if Child:IsA("Model") then
+                    InFolder = InFolder + 1
+                    if not AliveZombies[Child] then
+                        Register(AliveZombies, Child, UnregisterZombie)
                     end
                 end
-                for _ in pairs(AliveZombies) do Tracked = Tracked + 1 end
-                if InFolder > 0 and Tracked == 0 then
-                    print("[StoryFarm] Rescan: " .. InFolder .. " zombies in folder but 0 tracked")
+            end
+            for _ in pairs(AliveZombies) do Tracked = Tracked + 1 end
+
+            -- Hard-reset: if zombies exist but we can't track any for 10s+, wipe cache and re-register everything
+            if InFolder > 0 and Tracked == 0 then
+                StuckSince = StuckSince or tick()
+                print("[StoryFarm] Rescan: " .. InFolder .. " zombies in folder but 0 tracked (stuck "
+                    .. math.floor(tick() - StuckSince) .. "s)")
+
+                if tick() - StuckSince >= 10 then
+                    print("[StoryFarm] HARD RESET zombie tracker")
+                    -- Detach + clear cache + force fresh AttachZombieFolder
+                    for _, Conn in ipairs(ZombieFolderConns) do
+                        pcall(function() Conn:Disconnect() end)
+                    end
+                    ZombieFolderConns = {}
+                    for Model, Entry in pairs(AliveZombies) do
+                        for _, Conn in ipairs(Entry.Conns) do
+                            pcall(function() Conn:Disconnect() end)
+                        end
+                        AliveZombies[Model] = nil
+                    end
+                    CurrentZombieFolder = nil
+                    AttachZombieFolder(Folder)
+                    StuckSince = nil
                 end
+            else
+                StuckSince = nil
             end
         end
     end)
@@ -416,23 +454,62 @@ local function GoUnderground()
     HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
 end
 
--- TP to under any tracked zombie/boss so we never sit in dead space between attacks
+-- Cached raycast params so we don't build a new one each tick
+local UnderRaycastParams = RaycastParams.new()
+UnderRaycastParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function RefreshRaycastFilter()
+    local Filter = {}
+    if Character then table.insert(Filter, Character) end
+    -- Alive = players, Zombies/Thrown = enemies & projectiles, Pets/PET_ANCHORS = our pet system
+    -- (paths per PetClient.lua:14 + :47-49). Filtering pets out so they can't break our floor cast.
+    for _, Name in ipairs({ "Alive", "Zombies", "Thrown", "Pets", "PET_ANCHORS" }) do
+        local F = workspace:FindFirstChild(Name)
+        if F then table.insert(Filter, F) end
+    end
+    UnderRaycastParams.FilterDescendantsInstances = Filter
+end
+
+-- Pick the LOWEST-Y live zombie/boss as our underground anchor.
+-- Picking the lowest one ensures we end up beneath actual ground geometry, not
+-- suspended mid-air below a zombie spawning from above (the section 6 spawn room
+-- problem where ground zombies could still hit us).
 local function GoUnderZombie()
     if not IsCharValid() then return false end
 
+    local BestRoot, BestY = nil, math.huge
     for _, Cache in ipairs({ AliveBosses, AliveZombies }) do
         for _, Data in pairs(Cache) do
             if IsZombieDataLive(Data) then
-                local Pos = Data.Root.Position
-                HRP.CFrame = CFrame.new(Pos.X, Pos.Y - UNDERGROUND_Y, Pos.Z)
-                HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-                return true
+                local Y = Data.Root.Position.Y
+                if Y < BestY then
+                    BestRoot, BestY = Data.Root, Y
+                end
             end
         end
     end
 
-    GoUnderground()
-    return false
+    if not BestRoot then
+        GoUnderground()
+        return false
+    end
+
+    local Pos = BestRoot.Position
+
+    -- Raycast straight down (filtering out alive entities) to find real ground.
+    -- Then go UNDERGROUND_Y below ground level, not just below the zombie.
+    RefreshRaycastFilter()
+    local Hit = workspace:Raycast(Pos + Vector3.new(0, 2, 0), Vector3.new(0, -500, 0), UnderRaycastParams)
+    local TargetY
+    if Hit then
+        TargetY = Hit.Position.Y - UNDERGROUND_Y
+    else
+        TargetY = Pos.Y - UNDERGROUND_Y -- fallback: zombie-relative
+    end
+
+    HRP.CFrame = CFrame.new(Pos.X, TargetY, Pos.Z)
+    HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+    return true
 end
 
 local function GoToZombie(Root)
@@ -630,7 +707,18 @@ task.spawn(function()
                 return
             end
 
-            HRP.CFrame = CFrame.new(Center + Vector3.new(0, ATTACK_HEIGHT, 0))
+            -- Surface at ground+ATTACK_HEIGHT relative to the cluster's actual ground,
+            -- not the zombies' Y (which can be airborne in spawn rooms). Raycast down
+            -- from above the cluster to find the floor.
+            RefreshRaycastFilter()
+            local FloorHit = workspace:Raycast(
+                Center + Vector3.new(0, 200, 0),
+                Vector3.new(0, -500, 0),
+                UnderRaycastParams
+            )
+            local SurfaceY = FloorHit and (FloorHit.Position.Y + ATTACK_HEIGHT) or (Center.Y + ATTACK_HEIGHT)
+
+            HRP.CFrame = CFrame.new(Center.X, SurfaceY, Center.Z)
             HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
             task.wait(0.03)
 
@@ -1116,7 +1204,7 @@ end
 -- Last-resort target watchdog: if cache is empty and a raid is active, force a folder rescan
 task.spawn(function()
     while true do
-        task.wait(8)
+        task.wait(3)
         if not Running then continue end
 
         local HaveAny = false
