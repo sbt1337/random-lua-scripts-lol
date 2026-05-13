@@ -31,7 +31,7 @@ local Stats = {
 local WEBHOOK = "https://discord.com/api/webhooks/1503857688118034662/H3y9e9EUyyZyRnKCQ-X_eIdRpejU8OwStg22dzEoycfGt__iAhRTYmnumIenbFWEckS7"
 local UNDERGROUND_Y = 10
 local ATTACK_HEIGHT = 5
-local MAX_ZOMBIE_RANGE = 1000000 -- effectively uncapped so we follow zombies into new sections
+local MAX_ZOMBIE_RANGE = 10000 -- effectively uncapped so we follow zombies into new sections
 local ATTACK_COOLDOWN_PER_ZOMBIE = 0.3 -- just enough for death events to propagate
 local ATTACK_TIMEOUT = 4
 local STATS_INTERVAL = 1800
@@ -787,10 +787,24 @@ local function SetupCharacter(NewCharacter)
             return
         end
 
-        -- Wait out forcefield invuln (no nudging needed, just sit there)
-        WaitForForceField(NewCharacter, 6)
+        -- Walk 20 studs forward to break forcefield / unstick from spawn
+        Safe("WalkOutOfSpawn", function()
+            local Target = HRP.Position + HRP.CFrame.LookVector * 20
+            Humanoid:MoveTo(Target)
 
-        -- Re-verify char is still good after wait
+            local Done = false
+            local Conn = Humanoid.MoveToFinished:Connect(function() Done = true end)
+            local Deadline = tick() + 3
+            while not Done and tick() < Deadline do
+                if not IsCharValid() then break end
+                task.wait(0.1)
+            end
+            pcall(function() Conn:Disconnect() end)
+        end)
+
+        -- Wait out any remaining forcefield invuln
+        WaitForForceField(NewCharacter, 5)
+
         if not IsCharValid() then return end
         Safe("InitialUnderground", GoUnderground)
         print("[StoryFarm] Underground, hunting")
