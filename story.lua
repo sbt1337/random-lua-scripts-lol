@@ -32,7 +32,7 @@ local Stats = {
 local WEBHOOK = "https://discord.com/api/webhooks/1503857688118034662/H3y9e9EUyyZyRnKCQ-X_eIdRpejU8OwStg22dzEoycfGt__iAhRTYmnumIenbFWEckS7"
 local UNDERGROUND_Y = 10
 local ATTACK_HEIGHT = 5
-local MAX_ZOMBIE_RANGE = math.huge -- effectively uncapped so we follow zombies into new sections
+local MAX_ZOMBIE_RANGE = 10000 -- effectively uncapped so we follow zombies into new sections
 local ATTACK_COOLDOWN_PER_ZOMBIE = 0.3 -- just enough for death events to propagate
 local ATTACK_TIMEOUT = 4
 local STATS_INTERVAL = 1800
@@ -744,27 +744,38 @@ local function GetEscapePart()
     return nil
 end
 
+-- Objective gate: only escape when workspace.Objectives has a visible child
+-- whose Name starts with "Escape" (e.g. "Escape Shibuya!", "Escape Impel Down!").
+-- Per ObjectivesPanel.lua:50 the objective name IS the displayed text.
+local function HasEscapeObjective()
+    local Folder = workspace:FindFirstChild("Objectives")
+    if not Folder then return false end
+    for _, Obj in ipairs(Folder:GetChildren()) do
+        if not Obj:GetAttribute("Hidden") then
+            if string.sub(Obj.Name, 1, 6):lower() == "escape" then
+                return true, Obj.Name
+            end
+        end
+    end
+    return false
+end
+
 task.spawn(function()
     while true do
-        task.wait(2)
+        task.wait(1)
         if not Running then continue end
         if workspace:FindFirstChild("GameFinished") then continue end
         if workspace:FindFirstChild("Cutscene") then continue end
         if not IsCharValid() then continue end
 
-        -- Only attempt escape when both caches are empty (boss + all zombies cleared)
-        local HasEnemies = false
-        for _ in pairs(AliveBosses) do HasEnemies = true break end
-        if not HasEnemies then
-            for _ in pairs(AliveZombies) do HasEnemies = true break end
-        end
-        if HasEnemies then continue end
+        local Active, ObjName = HasEscapeObjective()
+        if not Active then continue end
 
         Safe("AutoEscape", function()
             local Part, Kind = GetEscapePart()
             if not Part then return end
 
-            print("[StoryFarm] No enemies left, TPing to " .. Kind .. " to escape")
+            print("[StoryFarm] Objective '" .. ObjName .. "' active, TPing to " .. Kind)
             HRP.CFrame = Part.CFrame + Vector3.new(0, 3, 0)
             HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
         end)
