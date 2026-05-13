@@ -246,22 +246,26 @@ local function Register(Cache, Model, OnDeath)
     if Cache[Model] then return end
     if FailedRegister[Model] then return end -- already tried, gave up
 
-    -- Don't double-register: if this model is already tracked in the OTHER cache (boss vs zombie), skip.
-    -- Bosses (CollectionService tagged "RaidBoss"/"Boss") show up in workspace.Zombies too — the boss
-    -- tracker handles them via tags, so the zombie tracker should ignore them.
-    if Cache == AliveZombies then
-        if AliveBosses[Model] then return end
-        if CollectionService:HasTag(Model, "RaidBoss") then return end
-        if CollectionService:HasTag(Model, "Boss") and Model:GetAttribute("IsRaidBoss") then return end
+    -- Boss tag check (called repeatedly inside the retry loop since the server tags bosses a few seconds after parenting)
+    local function IsTaggedBoss()
+        if Cache ~= AliveZombies then return false end
+        if AliveBosses[Model] then return true end
+        if CollectionService:HasTag(Model, "RaidBoss") then return true end
+        if CollectionService:HasTag(Model, "Boss") and Model:GetAttribute("IsRaidBoss") then return true end
+        return false
     end
+
+    if IsTaggedBoss() then return end
 
     task.spawn(function()
         Safe("Register", function()
-            -- Wait briefly for descendants to populate
+            -- Wait up to 15s for descendants to populate (game's own UI uses 10s; we go a bit higher).
+            -- Re-check boss tags every poll cycle so we bail the moment the server tags this as a boss.
             local Health, HealthPath = ResolveHealth(Model)
             if not Health then
-                local Deadline = tick() + 8
+                local Deadline = tick() + 15
                 while not Health and tick() < Deadline and Model.Parent do
+                    if IsTaggedBoss() then return end -- boss tracker will take it from here
                     task.wait(0.1)
                     Health, HealthPath = ResolveHealth(Model)
                 end
@@ -269,17 +273,9 @@ local function Register(Cache, Model, OnDeath)
 
             if not Health then
                 FailedRegister[Model] = tick()
-                -- Send a one-shot webhook so we can see the unknown structure
-                local Names = {}
-                for _, C in ipairs(Model:GetChildren()) do
-                    table.insert(Names, C.ClassName .. ":" .. C.Name)
-                    if #Names >= 12 then break end
+                if not IsTaggedBoss() then
+                    print("[StoryFarm] Register: no Health on " .. Model.Name .. " (blacklisted)")
                 end
-                SendWebhook("Unknown enemy structure", {
-                    { name = "Model",    value = Model.Name,                 inline = true },
-                    { name = "Children", value = "```" .. table.concat(Names, ", ") .. "```", inline = false },
-                }, 15105570)
-                print("[StoryFarm] Register: no Health found on " .. Model.Name .. " (blacklisted)")
                 return
             end
 
