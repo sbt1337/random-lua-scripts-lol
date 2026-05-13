@@ -269,6 +269,12 @@ local function Register(Cache, Model, OnDeath)
     end)
 end
 
+local function IsZombieDataLive(Data)
+    if not Data or not Data.Root or not Data.Root.Parent then return false end
+    if not Data.Health or not Data.Health.Parent then return false end
+    return Data.Health.Value > 0
+end
+
 -- Bootstrap zombies (survives Zombies folder being destroyed/replaced between matches)
 local ZombieFolderConns = {}
 local CurrentZombieFolder = nil
@@ -460,12 +466,6 @@ local function IsZombieStillAlive(Model)
 end
 
 -- Movement
-local function IsZombieDataLive(Data)
-    if not Data or not Data.Root or not Data.Root.Parent then return false end
-    if not Data.Health or not Data.Health.Parent then return false end
-    return Data.Health.Value > 0
-end
-
 local function GoUnderground()
     if not IsCharValid() then return end
     HRP.CFrame = CFrame.new(HRP.Position.X, HRP.Position.Y - UNDERGROUND_Y, HRP.Position.Z)
