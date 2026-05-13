@@ -61,6 +61,7 @@ local DAMAGE_ABORT_THRESHOLD = 1 -- HP drop in one tick that triggers immediate 
 local AliveZombies = {}
 local AliveBosses = {}
 local RecentlyAttacked = {}
+local LastAttackAt = tick() -- updated each time we fire an ability; used by stuck-recovery + heartbeat
 
 -- Game's blocking state child names (from Utils.ActionCheck)
 local BLOCKING_STATES = { "LightAttack", "NoAttack", "Action", "Stun", "UsingMove" }
@@ -78,55 +79,62 @@ print("[StoryFarm] Loaded")
 -- Log webhook: batches print() output and flushes every 3s so we can read it on mobile.
 -- Discord allows ~30 req/min/webhook; batching keeps us well under that.
 local LogBuffer = {}
-local LogBufferLock = false
 local RawPrint = print
+local LogStats = { Sent = 0, Failed = 0, Dropped = 0 }
 
 local function FlushLogs()
     if #LogBuffer == 0 then return end
-    if LogBufferLock then return end
-    LogBufferLock = true
 
-    -- Drain up to ~1800 chars (Discord field limit is 1024 per field, msg 2000)
-    local Lines = {}
-    local TotalLen = 0
-    while #LogBuffer > 0 do
-        local Line = LogBuffer[1]
-        if TotalLen + #Line + 1 > 1800 then break end
+    -- Snapshot then clear, so the lock can never deadlock
+    local Snapshot = LogBuffer
+    LogBuffer = {}
+
+    -- Pull lines that fit in ~1800 chars; re-queue the rest at front
+    local Lines, TotalLen = {}, 0
+    for i, Line in ipairs(Snapshot) do
+        if TotalLen + #Line + 1 > 1800 then
+            for j = i, #Snapshot do
+                table.insert(LogBuffer, j - i + 1, Snapshot[j])
+            end
+            break
+        end
         table.insert(Lines, Line)
         TotalLen = TotalLen + #Line + 1
-        table.remove(LogBuffer, 1)
     end
 
     local Payload = table.concat(Lines, "\n")
+    if #Payload == 0 then return end
 
-    pcall(function()
+    local RequestFunc = (syn and syn.request) or request or http_request
+    if not RequestFunc then
+        LogStats.Dropped = LogStats.Dropped + #Lines
+        return
+    end
+
+    local ok = pcall(function()
         local Body = HttpService:JSONEncode({
             username = "StoryFarm Logs",
             content = "```" .. Payload .. "```",
         })
-        local RequestFunc = (syn and syn.request) or request or http_request
-        if RequestFunc then
-            RequestFunc({
-                Url = LOG_WEBHOOK,
-                Method = "POST",
-                Headers = { ["Content-Type"] = "application/json" },
-                Body = Body,
-            })
-        end
+        RequestFunc({
+            Url = LOG_WEBHOOK,
+            Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = Body,
+        })
     end)
-
-    LogBufferLock = false
+    if ok then LogStats.Sent = LogStats.Sent + #Lines
+    else LogStats.Failed = LogStats.Failed + #Lines end
 end
 
 -- Override print so any existing print() call also goes to the log webhook.
 print = function(...)
-    local Args = { ... }
+    local n = select("#", ...)
     local Parts = {}
-    for i = 1, select("#", ...) do
-        Parts[i] = tostring(Args[i])
-    end
+    for i = 1, n do Parts[i] = tostring((select(i, ...))) end
     local Msg = table.concat(Parts, " ")
-    RawPrint(Msg) -- still goes to F9
+    pcall(RawPrint, Msg) -- still goes to F9; pcall so a print error can't propagate
+    if #LogBuffer >= 300 then table.remove(LogBuffer, 1) end -- cap buffer to prevent runaway memory
     table.insert(LogBuffer, os.date("%H:%M:%S") .. " " .. Msg)
 end
 
@@ -134,6 +142,25 @@ task.spawn(function()
     while true do
         task.wait(3)
         pcall(FlushLogs)
+    end
+end)
+
+-- Heartbeat: prints script state every 30s so we know it's still alive even if nothing else logs
+task.spawn(function()
+    while true do
+        task.wait(30)
+        pcall(function()
+            local Z = 0
+            for _ in pairs(AliveZombies) do Z = Z + 1 end
+            local Folder = workspace:FindFirstChild("Zombies")
+            local InFolder = Folder and #Folder:GetChildren() or 0
+            print("[Heartbeat] running=" .. tostring(Running)
+                .. " cached=" .. Z
+                .. " folder=" .. InFolder
+                .. " attacks=" .. Stats.AttacksAttempted
+                .. " matches=" .. Stats.MatchesCompleted
+                .. " sinceAttack=" .. math.floor(tick() - LastAttackAt) .. "s")
+        end)
     end
 end)
 
@@ -780,8 +807,6 @@ local function PickAttackCenter(Target)
 
     return Best, BestCount
 end
-
-local LastAttackAt = tick() -- updated each time we fire an ability; used by stuck-recovery watchdog
 
 -- Main attack loop
 task.spawn(function()
