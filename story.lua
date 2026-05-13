@@ -24,6 +24,8 @@ local Stats = {
     AttacksAborted = 0,
     MatchesCompleted = 0,
     Rebirths = 0,
+    TotalKills = 0,
+    TotalDamage = 0,
     StartTime = tick(),
 }
 
@@ -112,6 +114,20 @@ local function IsActionBlocked()
     if workspace:FindFirstChild("Cutscene") then return true end
     if workspace:FindFirstChild("GameFinished") then return true end
     return false
+end
+
+-- Read our current-match stats from workspace.MatchConfig.PlayersStats (JSON StringValue).
+-- Per _LocalFX.lua:16002 the value is HttpService:JSONDecode'd; entries look like
+-- { Kills = N, DamageDealt = N, Drops = {...} }
+local function GetMatchStats()
+    local MatchConfig = workspace:FindFirstChild("MatchConfig")
+    if not MatchConfig then return nil end
+    local PlayersStats = MatchConfig:FindFirstChild("PlayersStats")
+    if not PlayersStats then return nil end
+
+    local ok, Decoded = pcall(HttpService.JSONDecode, HttpService, PlayersStats.Value)
+    if not ok or type(Decoded) ~= "table" then return nil end
+    return Decoded[LocalPlayer.Name]
 end
 
 local function GetData()
@@ -665,12 +681,21 @@ task.spawn(function()
             if not RetryButton.Visible then return end
             Safe("EndScreenFired", function()
                 local Data = GetData()
+                local Match = GetMatchStats()
                 Stats.MatchesCompleted = Stats.MatchesCompleted + 1
 
+                local MatchKills  = (Match and type(Match.Kills)       == "number") and Match.Kills       or 0
+                local MatchDamage = (Match and type(Match.DamageDealt) == "number") and Match.DamageDealt or 0
+                Stats.TotalKills  = Stats.TotalKills  + MatchKills
+                Stats.TotalDamage = Stats.TotalDamage + MatchDamage
+
                 SendWebhook("Match Over", {
-                    { name = "Coins",    value = Data and tostring(Data.Coins)    or "?", inline = true },
-                    { name = "Level",    value = Data and tostring(Data.Level)    or "?", inline = true },
-                    { name = "Rebirths", value = Data and tostring(Data.Rebirths) or "?", inline = true },
+                    { name = "Coins",       value = Data and tostring(Data.Coins)    or "?", inline = true },
+                    { name = "Level",       value = Data and tostring(Data.Level)    or "?", inline = true },
+                    { name = "Rebirths",    value = Data and tostring(Data.Rebirths) or "?", inline = true },
+                    { name = "Match Kills", value = tostring(MatchKills),                    inline = true },
+                    { name = "Match Dmg",   value = tostring(MatchDamage),                   inline = true },
+                    { name = "Total Kills", value = tostring(Stats.TotalKills),              inline = true },
                 }, 3066993)
 
                 if Running then
@@ -684,6 +709,93 @@ task.spawn(function()
         print("[StoryFarm] Watching for EndScreen...")
     end)
 end)
+
+-- Auto-escape: TP to the Train (Shibuya) or Door (Impel Down) once enemies are clear.
+-- Server then fires the Escaped remote (_LocalFX.lua:15892) which teleports us out.
+local function GetEscapePart()
+    local Map = workspace:FindFirstChild("Map")
+    if not Map then return nil end
+
+    -- Shibuya: workspace.Map.Train.Model
+    local Train = Map:FindFirstChild("Train")
+    if Train then
+        local Model = Train:FindFirstChild("Model")
+        if Model then
+            return Model.PrimaryPart or Model:FindFirstChildWhichIsA("BasePart"), "Train"
+        end
+    end
+
+    -- Impel Down: workspace.Map.Objective.Entries.Model.Door
+    local Objective = Map:FindFirstChild("Objective")
+    if Objective then
+        local Entries = Objective:FindFirstChild("Entries")
+        if Entries then
+            local Model = Entries:FindFirstChild("Model")
+            if Model then
+                local Door = Model:FindFirstChild("Door")
+                if Door then
+                    if Door:IsA("BasePart") then return Door, "Door" end
+                    return Door.PrimaryPart or Door:FindFirstChildWhichIsA("BasePart"), "Door"
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+task.spawn(function()
+    while true do
+        task.wait(2)
+        if not Running then continue end
+        if workspace:FindFirstChild("GameFinished") then continue end
+        if workspace:FindFirstChild("Cutscene") then continue end
+        if not IsCharValid() then continue end
+
+        -- Only attempt escape when both caches are empty (boss + all zombies cleared)
+        local HasEnemies = false
+        for _ in pairs(AliveBosses) do HasEnemies = true break end
+        if not HasEnemies then
+            for _ in pairs(AliveZombies) do HasEnemies = true break end
+        end
+        if HasEnemies then continue end
+
+        Safe("AutoEscape", function()
+            local Part, Kind = GetEscapePart()
+            if not Part then return end
+
+            print("[StoryFarm] No enemies left, TPing to " .. Kind .. " to escape")
+            HRP.CFrame = Part.CFrame + Vector3.new(0, 3, 0)
+            HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        end)
+    end
+end)
+
+-- Auto-revive (Ultra Instinct / standard revive). Server sets CanRevive=true on Character;
+-- fire Interact:FireServer("Revive") to consume it. Matches ClientUI.lua:1330 and CharacterHandler/Client.lua:1756.
+local ReviveAttrConn = nil
+local function HookReviveListener(Char)
+    if ReviveAttrConn then
+        pcall(function() ReviveAttrConn:Disconnect() end)
+        ReviveAttrConn = nil
+    end
+    if not Char then return end
+
+    local function TryRevive()
+        if not Running then return end
+        if not Char or not Char.Parent then return end
+        if not Char:GetAttribute("CanRevive") then return end
+        Safe("AutoRevive", function()
+            local Interact = GetInteract()
+            if not Interact then return end
+            print("[StoryFarm] CanRevive=true, firing Revive")
+            Interact:FireServer("Revive")
+        end)
+    end
+
+    ReviveAttrConn = Char:GetAttributeChangedSignal("CanRevive"):Connect(TryRevive)
+    TryRevive() -- in case it's already true at hook time
+end
 
 -- Auto start raid
 task.spawn(function()
@@ -716,10 +828,16 @@ task.spawn(function()
             local Data = GetData()
             local Runtime = math.floor((tick() - Stats.StartTime) / 60)
 
+            local LiveMatch = GetMatchStats()
+            local LiveKills = (LiveMatch and type(LiveMatch.Kills) == "number") and LiveMatch.Kills or 0
+            local SessionKills = Stats.TotalKills + LiveKills -- include current in-progress match
+
             SendWebhook("Status Report", {
                 { name = "Runtime",         value = Runtime .. " min",                       inline = true },
                 { name = "Matches",         value = tostring(Stats.MatchesCompleted),        inline = true },
                 { name = "Rebirths Done",   value = tostring(Stats.Rebirths),                inline = true },
+                { name = "Total Kills",     value = tostring(SessionKills),                  inline = true },
+                { name = "Total Damage",    value = tostring(Stats.TotalDamage),             inline = true },
                 { name = "Attacks",         value = tostring(Stats.AttacksAttempted),        inline = true },
                 { name = "Aborted",         value = tostring(Stats.AttacksAborted),          inline = true },
                 { name = "Zombies Tracked", value = tostring((function()
@@ -794,6 +912,9 @@ local function SetupCharacter(NewCharacter)
             print("[StoryFarm] Missing Humanoid/HRP after spawn")
             return
         end
+
+        -- Arm auto-revive (CanRevive attribute on Character)
+        HookReviveListener(NewCharacter)
 
         -- Walk 20 studs forward to break forcefield / unstick from spawn
         Safe("WalkOutOfSpawn", function()
