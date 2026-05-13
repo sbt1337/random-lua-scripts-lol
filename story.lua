@@ -17,6 +17,8 @@ local Attacking = false
 local AttackStartTime = 0
 local CurrentTarget = nil
 local CurrentTargetIsBoss = false
+local UndergroundAnchor = nil
+local SlotCooldownEnd = { 0, 0, 0, 0 } -- per-slot cooldown end time, set by UsedAbility event
 
 local Stats = {
     AttacksAttempted = 0,
@@ -33,6 +35,8 @@ local MAX_ZOMBIE_RANGE = 400
 local ATTACK_COOLDOWN_PER_ZOMBIE = 0.3 -- just enough for death events to propagate
 local ATTACK_TIMEOUT = 4
 local STATS_INTERVAL = 1800
+local AOE_RADIUS = 12 -- assumed melee/AOE hitbox radius for cluster-picking
+local ATTACK_WINDOW = 1.5 -- max seconds we spend at the surface per cycle
 
 -- Live caches updated by events (not polling)
 -- [Model] = { Root = HRP, Health = IntValue, Conns = {connections} }
@@ -326,8 +330,21 @@ end
 -- Movement
 local function GoUnderground()
     if not IsCharValid() then return end
-    HRP.CFrame = CFrame.new(HRP.Position.X, HRP.Position.Y - UNDERGROUND_Y, HRP.Position.Z)
+    local Anchor = CFrame.new(HRP.Position.X, HRP.Position.Y - UNDERGROUND_Y, HRP.Position.Z)
+    UndergroundAnchor = Anchor
+    HRP.CFrame = Anchor
+    HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
 end
+
+-- Hold underground while idle so we don't fall into the void between attack cycles
+RunService.Heartbeat:Connect(function()
+    if not Running then return end
+    if Attacking then return end
+    if not UndergroundAnchor then return end
+    if not IsCharValid() then return end
+    HRP.CFrame = UndergroundAnchor
+    HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+end)
 
 local function GoToZombie(Root)
     if not IsCharValid() then return end
@@ -368,6 +385,83 @@ task.spawn(function()
     end
 end)
 
+-- Authoritative per-slot cooldown from server (already accounts for CD reduction cosmetics)
+task.spawn(function()
+    Safe("CooldownHook", function()
+        local Assets = ReplicatedStorage:WaitForChild("Assets", 30)
+        local Remotes = Assets:WaitForChild("Remotes", 30)
+        local UsedAbility = Remotes:WaitForChild("UsedAbility", 30)
+
+        UsedAbility.OnClientEvent:Connect(function(_, Duration, _AbilityName, KeyIndex)
+            if type(Duration) ~= "number" then return end
+            if type(KeyIndex) ~= "number" or KeyIndex < 1 or KeyIndex > 4 then return end
+            SlotCooldownEnd[KeyIndex] = tick() + Duration
+        end)
+
+        print("[StoryFarm] Cooldown hook armed")
+    end)
+end)
+
+local function PickReadySlot()
+    local Now = tick()
+    for i = 1, 3 do -- skip V (slot 4)
+        if SlotCooldownEnd[i] <= Now then return i end
+    end
+    return nil
+end
+
+local function AnySlotReady()
+    local Now = tick()
+    for i = 1, 3 do
+        if SlotCooldownEnd[i] <= Now then return true end
+    end
+    return false
+end
+
+-- Pick a TP center that maximizes zombies inside AOE_RADIUS
+local function PickAttackCenter(Target)
+    local TargetData = GetTargetEntry(Target)
+    if not TargetData or not TargetData.Root or not TargetData.Root.Parent then return nil, 0 end
+
+    local Best = TargetData.Root.Position
+    local BestCount = 1
+    local Search = (AOE_RADIUS * 2) * (AOE_RADIUS * 2)
+
+    -- Candidate centers = target + any zombie close enough to potentially cluster with it
+    local Candidates = { Best }
+    for _, Data in pairs(AliveZombies) do
+        if Data.Root and Data.Root.Parent and Data.Health.Value > 0 then
+            local Pos = Data.Root.Position
+            local Dx = Pos.X - Best.X
+            local Dz = Pos.Z - Best.Z
+            if (Dx * Dx + Dz * Dz) < Search then
+                table.insert(Candidates, Pos)
+            end
+        end
+    end
+
+    local Radius2 = AOE_RADIUS * AOE_RADIUS
+    for _, Center in ipairs(Candidates) do
+        local Count = 0
+        for _, Data in pairs(AliveZombies) do
+            if Data.Root and Data.Root.Parent and Data.Health.Value > 0 then
+                local Pos = Data.Root.Position
+                local Dx = Pos.X - Center.X
+                local Dz = Pos.Z - Center.Z
+                if (Dx * Dx + Dz * Dz) <= Radius2 then
+                    Count = Count + 1
+                end
+            end
+        end
+        if Count > BestCount then
+            BestCount = Count
+            Best = Center
+        end
+    end
+
+    return Best, BestCount
+end
+
 -- Main attack loop
 task.spawn(function()
     while true do
@@ -388,6 +482,16 @@ task.spawn(function()
 
             local SlotName, AbilityName = GetAbilityInfo()
             if not SlotName or not AbilityName then task.wait(0.5) return end
+
+            -- Wait underground until abilities are off cooldown / state clears
+            if IsActionBlocked() then
+                task.wait(0.1)
+                return
+            end
+            if not AnySlotReady() then
+                task.wait(0.1)
+                return
+            end
 
             local Target, IsBoss = PickNearestZombie()
             if not Target then
@@ -420,38 +524,54 @@ task.spawn(function()
             CurrentTargetIsBoss = IsBoss
             RecentlyAttacked[Target] = tick() + ATTACK_COOLDOWN_PER_ZOMBIE
 
-            GoToZombie(Root)
-            task.wait(0.03)
-
-            -- Verify after TP
-            if not IsZombieStillAlive(Target) then
+            -- Pick the densest cluster around the target so one swing hits the most zombies
+            local Center, Hits = PickAttackCenter(Target)
+            if not Center then
                 Stats.AttacksAborted = Stats.AttacksAborted + 1
                 GoUnderground()
                 Attacking = false
                 return
             end
 
-            -- Fire abilities (skip slot 4 / V), checking ActionCheck between each
-            for i = 1, 3 do
+            HRP.CFrame = CFrame.new(Center + Vector3.new(0, ATTACK_HEIGHT, 0))
+            HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+            task.wait(0.03)
+
+            if not IsZombieStillAlive(Target) and Hits <= 1 then
+                Stats.AttacksAborted = Stats.AttacksAborted + 1
+                GoUnderground()
+                Attacking = false
+                return
+            end
+
+            -- Cycle through ready slots (1..3) until window closes or all on CD
+            local Deadline = tick() + ATTACK_WINDOW
+            local Fired = 0
+            while tick() < Deadline do
                 if not IsCharValid() then break end
-                if not IsZombieStillAlive(Target) then break end
 
-                -- Wait briefly if game state is blocking
-                local WaitStart = tick()
-                while IsActionBlocked() and (tick() - WaitStart) < 0.3 do
+                if IsActionBlocked() then
                     task.wait(0.03)
+                    continue
                 end
 
-                if not IsActionBlocked() then
-                    Interact:FireServer("Ability", i, SlotName, AbilityName, "Began")
-                    task.wait(0.03)
-                    Interact:FireServer("Ability", i, SlotName, AbilityName, "Released")
-                end
+                local Slot = PickReadySlot()
+                if not Slot then break end
+
+                Interact:FireServer("Ability", Slot, SlotName, AbilityName, "Began")
                 task.wait(0.03)
+                Interact:FireServer("Ability", Slot, SlotName, AbilityName, "Released")
+
+                -- Soft cooldown until server confirms via UsedAbility (prevents same-slot spam if event is late)
+                if SlotCooldownEnd[Slot] <= tick() then
+                    SlotCooldownEnd[Slot] = tick() + 0.4
+                end
+                Fired = Fired + 1
+                task.wait(0.08)
             end
 
             GoUnderground()
-            task.wait(0.2)
+            task.wait(0.05)
             Attacking = false
         end)
     end
@@ -604,6 +724,8 @@ LocalPlayer.CharacterAdded:Connect(function(NewCharacter)
         Humanoid = NewCharacter:WaitForChild("Humanoid")
         HRP = NewCharacter:WaitForChild("HumanoidRootPart")
         Attacking = false
+        UndergroundAnchor = nil
+        SlotCooldownEnd = { 0, 0, 0, 0 }
 
         task.wait(1)
 
