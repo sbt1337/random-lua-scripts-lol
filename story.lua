@@ -781,17 +781,29 @@ local function IsEscapePrompt(Prompt)
     return string.find(Combined, "escape", 1, true) ~= nil
 end
 
+-- Walk up the prompt's ancestry to find the first BasePart we can stand on.
 local function ResolvePromptPart(Prompt)
-    local Parent = Prompt.Parent
-    if not Parent then return nil end
-    if Parent:IsA("BasePart") then return Parent end
-    if Parent:IsA("Model") then
-        return Parent.PrimaryPart or Parent:FindFirstChildWhichIsA("BasePart")
+    local Node = Prompt.Parent
+    while Node and Node ~= workspace do
+        if Node:IsA("BasePart") then return Node end
+        if Node:IsA("Model") then
+            local Pivot = Node.PrimaryPart or Node:FindFirstChildWhichIsA("BasePart")
+            if Pivot then return Pivot end
+        end
+        Node = Node.Parent
     end
-    return Parent:FindFirstChildWhichIsA("BasePart")
+    return nil
 end
 
 local function FindEscapePrompt()
+    -- Per user: prompt lives under workspace.Objectives. Check there first.
+    local Objectives = workspace:FindFirstChild("Objectives")
+    if Objectives then
+        for _, Inst in ipairs(Objectives:GetDescendants()) do
+            if IsEscapePrompt(Inst) then return Inst end
+        end
+    end
+    -- Fallback to full workspace scan
     for _, Inst in ipairs(workspace:GetDescendants()) do
         if IsEscapePrompt(Inst) then return Inst end
     end
@@ -799,7 +811,8 @@ local function FindEscapePrompt()
 end
 
 -- Spam-TP to the prompt's parent part and fire the prompt every tick while one exists.
--- Server may gate the prompt by distance, so being on top of it every frame is the safest play.
+-- Potassium's fireproximityprompt takes ONE arg (the prompt) and bypasses distance,
+-- but TPing on top of it is harmless and protects against server-side distance checks.
 task.spawn(function()
     Safe("EscapePromptSpammer", function()
         while true do
@@ -817,16 +830,15 @@ task.spawn(function()
             end
 
             if FireProx then
-                Safe("FireProx", function() FireProx(Prompt, 0) end)
+                Safe("FireProx", function() FireProx(Prompt) end)
             end
 
-            -- Log once per prompt instance
             if not FiredEscapePrompts[Prompt] then
                 FiredEscapePrompts[Prompt] = tick()
-                print("[StoryFarm] Escape prompt: " .. Prompt.Name
+                print("[StoryFarm] Escape prompt: " .. Prompt:GetFullName()
                     .. " | action='" .. (Prompt.ActionText or "")
                     .. "' object='" .. (Prompt.ObjectText or "") .. "'"
-                    .. " | parent=" .. (Part and Part:GetFullName() or "?"))
+                    .. " | tp=" .. (Part and Part:GetFullName() or "(no part)"))
             end
         end
     end)
