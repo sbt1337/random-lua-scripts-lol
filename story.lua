@@ -226,21 +226,59 @@ local function Register(Cache, Model, OnDeath)
     end)
 end
 
--- Bootstrap zombies
-task.spawn(function()
-    local ZombieFolder = workspace:WaitForChild("Zombies", 30)
-    if not ZombieFolder then return end
+-- Bootstrap zombies (survives Zombies folder being destroyed/replaced between matches)
+local ZombieFolderConns = {}
+local CurrentZombieFolder = nil
 
-    for _, Child in ipairs(ZombieFolder:GetChildren()) do
+local function AttachZombieFolder(Folder)
+    if CurrentZombieFolder == Folder then return end
+
+    for _, Conn in ipairs(ZombieFolderConns) do
+        pcall(function() Conn:Disconnect() end)
+    end
+    ZombieFolderConns = {}
+    CurrentZombieFolder = Folder
+
+    for _, Child in ipairs(Folder:GetChildren()) do
         Register(AliveZombies, Child, UnregisterZombie)
     end
 
-    ZombieFolder.ChildAdded:Connect(function(Child)
+    table.insert(ZombieFolderConns, Folder.ChildAdded:Connect(function(Child)
         Register(AliveZombies, Child, UnregisterZombie)
-    end)
-    ZombieFolder.ChildRemoved:Connect(UnregisterZombie)
+    end))
+    table.insert(ZombieFolderConns, Folder.ChildRemoved:Connect(UnregisterZombie))
+    table.insert(ZombieFolderConns, Folder.AncestryChanged:Connect(function()
+        if not Folder.Parent then CurrentZombieFolder = nil end
+    end))
 
-    print("[StoryFarm] Zombie tracker active")
+    print("[StoryFarm] Attached to Zombies folder")
+end
+
+task.spawn(function()
+    Safe("ZombieBootstrap", function()
+        local Existing = workspace:FindFirstChild("Zombies")
+        if Existing then AttachZombieFolder(Existing) end
+
+        workspace.ChildAdded:Connect(function(Child)
+            if Child.Name == "Zombies" then AttachZombieFolder(Child) end
+        end)
+
+        -- Periodic rescan in case events miss (cheap safety net)
+        while true do
+            task.wait(5)
+            local Folder = workspace:FindFirstChild("Zombies")
+            if Folder and Folder ~= CurrentZombieFolder then
+                AttachZombieFolder(Folder)
+            end
+            if Folder then
+                for _, Child in ipairs(Folder:GetChildren()) do
+                    if Child:IsA("Model") and not AliveZombies[Child] then
+                        Register(AliveZombies, Child, UnregisterZombie)
+                    end
+                end
+            end
+        end
+    end)
 end)
 
 -- Bootstrap bosses (CollectionService tagged "RaidBoss" or "Boss" with IsRaidBoss=true)
@@ -418,19 +456,24 @@ local function AnySlotReady()
     return false
 end
 
+local function IsZombieDataLive(Data)
+    if not Data or not Data.Root or not Data.Root.Parent then return false end
+    if not Data.Health or not Data.Health.Parent then return false end
+    return Data.Health.Value > 0
+end
+
 -- Pick a TP center that maximizes zombies inside AOE_RADIUS
 local function PickAttackCenter(Target)
     local TargetData = GetTargetEntry(Target)
-    if not TargetData or not TargetData.Root or not TargetData.Root.Parent then return nil, 0 end
+    if not IsZombieDataLive(TargetData) then return nil, 0 end
 
     local Best = TargetData.Root.Position
     local BestCount = 1
     local Search = (AOE_RADIUS * 2) * (AOE_RADIUS * 2)
 
-    -- Candidate centers = target + any zombie close enough to potentially cluster with it
     local Candidates = { Best }
     for _, Data in pairs(AliveZombies) do
-        if Data.Root and Data.Root.Parent and Data.Health.Value > 0 then
+        if IsZombieDataLive(Data) then
             local Pos = Data.Root.Position
             local Dx = Pos.X - Best.X
             local Dz = Pos.Z - Best.Z
@@ -444,7 +487,7 @@ local function PickAttackCenter(Target)
     for _, Center in ipairs(Candidates) do
         local Count = 0
         for _, Data in pairs(AliveZombies) do
-            if Data.Root and Data.Root.Parent and Data.Health.Value > 0 then
+            if IsZombieDataLive(Data) then
                 local Pos = Data.Root.Position
                 local Dx = Pos.X - Center.X
                 local Dz = Pos.Z - Center.Z
@@ -716,35 +759,82 @@ task.spawn(function()
     end
 end)
 
--- CharacterAdded
-LocalPlayer.CharacterAdded:Connect(function(NewCharacter)
-    Safe("CharacterAdded", function()
-        print("[StoryFarm] Character respawned")
+-- Wait for the ForceField on the character to be destroyed (or timeout)
+local function WaitForForceField(Char, Timeout)
+    local Deadline = tick() + (Timeout or 5)
+    while tick() < Deadline do
+        if not Char or not Char.Parent then return end
+        local FF = Char:FindFirstChildOfClass("ForceField")
+        if not FF then return end
+        task.wait(0.1)
+    end
+end
+
+-- Apply to initial character too
+local function SetupCharacter(NewCharacter)
+    Safe("SetupCharacter", function()
+        print("[StoryFarm] Character ready")
         Character = NewCharacter
-        Humanoid = NewCharacter:WaitForChild("Humanoid")
-        HRP = NewCharacter:WaitForChild("HumanoidRootPart")
+        Humanoid = NewCharacter:WaitForChild("Humanoid", 10)
+        HRP = NewCharacter:WaitForChild("HumanoidRootPart", 10)
         Attacking = false
         UndergroundAnchor = nil
+        CurrentTarget = nil
         SlotCooldownEnd = { 0, 0, 0, 0 }
 
-        task.wait(1)
+        if not Humanoid or not HRP then
+            print("[StoryFarm] Missing Humanoid/HRP after spawn")
+            return
+        end
 
-        local ForceConn
-        local Start = tick()
-        ForceConn = RunService.Stepped:Connect(function()
-            Safe("ForcefieldNudge", function()
-                if tick() - Start >= 2 then
-                    ForceConn:Disconnect()
-                    return
-                end
-                if HRP and HRP.Parent then
-                    HRP.Velocity = Vector3.new(0, 0, -10)
-                end
-            end)
-        end)
+        -- Wait out forcefield invuln (no nudging needed, just sit there)
+        WaitForForceField(NewCharacter, 6)
 
-        task.wait(2.5)
+        -- Re-verify char is still good after wait
+        if not IsCharValid() then return end
         Safe("InitialUnderground", GoUnderground)
         print("[StoryFarm] Underground, hunting")
     end)
+end
+
+LocalPlayer.CharacterAdded:Connect(SetupCharacter)
+
+-- Run setup for the character we already had at script load
+if Character and Character.Parent then
+    task.spawn(SetupCharacter, Character)
+end
+
+-- Last-resort target watchdog: if cache is empty and a raid is active, force a folder rescan
+task.spawn(function()
+    while true do
+        task.wait(8)
+        if not Running then continue end
+
+        local HaveAny = false
+        for _ in pairs(AliveZombies) do HaveAny = true break end
+        if HaveAny then continue end
+        for _ in pairs(AliveBosses) do HaveAny = true break end
+        if HaveAny then continue end
+
+        -- No tracked enemies — try to recover
+        Safe("TargetWatchdog", function()
+            local Folder = workspace:FindFirstChild("Zombies")
+            if Folder then
+                if Folder ~= CurrentZombieFolder then AttachZombieFolder(Folder) end
+                for _, Child in ipairs(Folder:GetChildren()) do
+                    if Child:IsA("Model") and not AliveZombies[Child] then
+                        Register(AliveZombies, Child, UnregisterZombie)
+                    end
+                end
+            end
+            for _, Tag in ipairs({ "RaidBoss", "Boss" }) do
+                for _, Boss in ipairs(CollectionService:GetTagged(Tag)) do
+                    if not AliveBosses[Boss] then
+                        if Tag == "Boss" and not Boss:GetAttribute("IsRaidBoss") then continue end
+                        Register(AliveBosses, Boss, UnregisterBoss)
+                    end
+                end
+            end
+        end)
+    end
 end)
