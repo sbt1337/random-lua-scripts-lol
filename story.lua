@@ -146,6 +146,7 @@ task.spawn(function()
 end)
 
 -- Heartbeat: prints script state every 30s so we know it's still alive even if nothing else logs
+local LastStuckAlarm = 0
 task.spawn(function()
     while true do
         task.wait(30)
@@ -153,13 +154,70 @@ task.spawn(function()
             local Z = 0
             for _ in pairs(AliveZombies) do Z = Z + 1 end
             local Folder = workspace:FindFirstChild("Zombies")
-            local InFolder = Folder and #Folder:GetChildren() or 0
+            local InFolder = 0
+            if Folder then
+                for _, Desc in ipairs(Folder:GetDescendants()) do
+                    if LooksLikeZombie(Desc) then InFolder = InFolder + 1 end
+                end
+            end
+            local SinceAttack = math.floor(tick() - LastAttackAt)
+            local GF = workspace:FindFirstChild("GameFinished") and "Y" or "N"
+            local SS = workspace:FindFirstChild("SwitchingSection") and "Y" or "N"
+            local CS = workspace:FindFirstChild("Cutscene") and "Y" or "N"
+
+            -- Scan workspace direct children for any folder/model containing zombie-like models.
+            local Locations = {}
+            local AllChildren = {}
+            for _, Child in ipairs(workspace:GetChildren()) do
+                table.insert(AllChildren, Child.Name .. ":" .. Child.ClassName)
+                local Count = 0
+                if Child:IsA("Folder") or Child:IsA("Model") then
+                    for _, Sub in ipairs(Child:GetChildren()) do
+                        if Sub:IsA("Model")
+                            and (Sub:FindFirstChild("Config") or Sub:FindFirstChild("HumanoidRootPart")) then
+                            Count = Count + 1
+                        end
+                    end
+                end
+                if Count > 0 then
+                    table.insert(Locations, Child.Name .. "=" .. Count)
+                end
+            end
+
+            -- Also scan CollectionService for any tag that has tagged models (revealing alt tracking systems)
+            local TagCounts = {}
+            for _, Tag in ipairs({ "RaidBoss", "Boss", "Zombie", "Enemy", "Mob", "EnemyMob" }) do
+                local Found = #CollectionService:GetTagged(Tag)
+                if Found > 0 then table.insert(TagCounts, Tag .. "=" .. Found) end
+            end
+
             print("[Heartbeat] running=" .. tostring(Running)
                 .. " cached=" .. Z
                 .. " folder=" .. InFolder
                 .. " attacks=" .. Stats.AttacksAttempted
                 .. " matches=" .. Stats.MatchesCompleted
-                .. " sinceAttack=" .. math.floor(tick() - LastAttackAt) .. "s")
+                .. " sinceAttack=" .. SinceAttack .. "s"
+                .. " GF=" .. GF .. " SS=" .. SS .. " CS=" .. CS)
+            print("[Heartbeat] locations=[" .. table.concat(Locations, ",") .. "]"
+                .. " tags=[" .. table.concat(TagCounts, ",") .. "]")
+            print("[Heartbeat] workspace=[" .. table.concat(AllChildren, ",") .. "]")
+
+            -- Escalated alarm: if we've gone >2 min with no attack AND zombies are visible, webhook it
+            if SinceAttack > 120 and InFolder > 0 and Running
+                and (tick() - LastStuckAlarm) > 300 then
+                LastStuckAlarm = tick()
+                SendWebhook("Script Stalled", {
+                    { name = "SinceAttack", value = SinceAttack .. "s", inline = true },
+                    { name = "Cached",      value = tostring(Z),        inline = true },
+                    { name = "Folder",      value = tostring(InFolder), inline = true },
+                    { name = "GameFinished",     value = GF, inline = true },
+                    { name = "SwitchingSection", value = SS, inline = true },
+                    { name = "Cutscene",         value = CS, inline = true },
+                    { name = "CurrentTarget",
+                      value = (CurrentTarget and CurrentTarget.Parent) and CurrentTarget.Name or "(none)",
+                      inline = false },
+                }, 15158332)
+            end
         end)
     end
 end)
@@ -431,7 +489,8 @@ local function Register(Cache, Model, OnDeath)
 
             if not Health then
                 FailedRegister[Model] = tick()
-                if not IsTaggedBoss() then
+                -- Silence the log if the model is gone (server briefly spawned/removed it) or it's now tagged as boss
+                if Model.Parent and not IsTaggedBoss() then
                     print("[StoryFarm] Register: no Health on " .. Model.Name .. " (blacklisted)")
                 end
                 return
@@ -515,20 +574,62 @@ local function AttachZombieFolder(Folder)
     ZombieFolderConns = {}
     CurrentZombieFolder = Folder
 
-    for _, Child in ipairs(Folder:GetChildren()) do
-        Register(AliveZombies, Child, UnregisterZombie)
+    -- workspace.Zombies is a Model. Zombies can be direct children OR nested in sub-models.
+    -- Use GetDescendants + LooksLikeZombie filter to catch them at any depth.
+    for _, Desc in ipairs(Folder:GetDescendants()) do
+        if LooksLikeZombie(Desc) then
+            Register(AliveZombies, Desc, UnregisterZombie)
+        end
     end
 
-    table.insert(ZombieFolderConns, Folder.ChildAdded:Connect(function(Child)
-        Register(AliveZombies, Child, UnregisterZombie)
+    table.insert(ZombieFolderConns, Folder.DescendantAdded:Connect(function(Desc)
+        if LooksLikeZombie(Desc) then
+            Register(AliveZombies, Desc, UnregisterZombie)
+        end
     end))
-    table.insert(ZombieFolderConns, Folder.ChildRemoved:Connect(UnregisterZombie))
+    table.insert(ZombieFolderConns, Folder.DescendantRemoving:Connect(function(Desc)
+        if AliveZombies[Desc] then UnregisterZombie(Desc) end
+    end))
     table.insert(ZombieFolderConns, Folder.AncestryChanged:Connect(function()
         if not Folder.Parent then CurrentZombieFolder = nil end
     end))
 
-    print("[StoryFarm] Attached to Zombies folder")
+    print("[StoryFarm] Attached to Zombies (Model). Initial descendants: " .. #Folder:GetDescendants())
 end
+
+-- Quick check: does this model look like a zombie (has Config.Health or Humanoid)?
+local function LooksLikeZombie(Inst)
+    if not Inst:IsA("Model") then return false end
+    -- Skip our own character and other players
+    if Players:GetPlayerFromCharacter(Inst) then return false end
+    -- Skip tagged bosses (boss tracker handles them)
+    if CollectionService:HasTag(Inst, "RaidBoss") then return false end
+    if CollectionService:HasTag(Inst, "Boss") and Inst:GetAttribute("IsRaidBoss") then return false end
+    -- Skip pets (workspace.Pets path)
+    if Inst:IsDescendantOf(workspace:FindFirstChild("Pets") or Inst) then return false end
+    if Inst:IsDescendantOf(workspace:FindFirstChild("Alive") or Inst) then return false end
+
+    local Config = Inst:FindFirstChild("Config")
+    if Config and Config:FindFirstChild("Health") then return true end
+    return false
+end
+
+-- Workspace-wide watcher: catches zombies parented to ANYWHERE in workspace, not just workspace.Zombies.
+-- This is the safety net when sections reparent zombies to a different folder.
+task.spawn(function()
+    Safe("WorkspaceWideZombieWatcher", function()
+        local function Try(Inst)
+            if LooksLikeZombie(Inst) and not AliveZombies[Inst] then
+                Register(AliveZombies, Inst, UnregisterZombie)
+            end
+        end
+
+        for _, Inst in ipairs(workspace:GetDescendants()) do Try(Inst) end
+        workspace.DescendantAdded:Connect(Try)
+
+        print("[StoryFarm] Workspace-wide zombie watcher armed")
+    end)
+end)
 
 task.spawn(function()
     Safe("ZombieBootstrap", function()
@@ -550,11 +651,12 @@ task.spawn(function()
             if not Folder then continue end
 
             local InFolder, Tracked = 0, 0
-            for _, Child in ipairs(Folder:GetChildren()) do
-                if Child:IsA("Model") then
+            -- workspace.Zombies is a Model — zombies can be at any descendant depth
+            for _, Desc in ipairs(Folder:GetDescendants()) do
+                if LooksLikeZombie(Desc) then
                     InFolder = InFolder + 1
-                    if not AliveZombies[Child] then
-                        Register(AliveZombies, Child, UnregisterZombie)
+                    if not AliveZombies[Desc] then
+                        Register(AliveZombies, Desc, UnregisterZombie)
                     end
                 end
             end
