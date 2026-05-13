@@ -292,13 +292,19 @@ local function Register(Cache, Model, OnDeath)
                 end
             end
 
-            -- Don't bail on Health=0 / Died=true at register time. Server may set HP a frame
-            -- after spawn, or recycle models with stale flags. ScanCache filters via IsZombieDataLive.
+            -- Critical: game uses INVERTED health semantics for zombies.
+            -- _LocalFX.lua:16505 destroys/death-SFXes when Config.Health.Value > 0,
+            -- so Health.Value <= 0 = ALIVE, > 0 = DEAD. Humanoid (standard) is normal.
             local Conns = {}
             local IsHumanoid = Health:IsA("Humanoid")
-            local GetHealth = IsHumanoid
-                and function() return Health.Health end
-                or  function() return Health.Value end
+            local IsAlive, GetHealth
+            if IsHumanoid then
+                IsAlive   = function() return Health.Health > 0 end
+                GetHealth = function() return Health.Health end
+            else
+                IsAlive   = function() return Health.Value <= 0 end
+                GetHealth = function() return Health.Value end
+            end
 
             if IsHumanoid then
                 table.insert(Conns, Health.HealthChanged:Connect(function(NewHP)
@@ -306,7 +312,7 @@ local function Register(Cache, Model, OnDeath)
                 end))
             else
                 table.insert(Conns, Health:GetPropertyChangedSignal("Value"):Connect(function()
-                    if Health.Value <= 0 then OnDeath(Model) end
+                    if Health.Value > 0 then OnDeath(Model) end -- inverted
                 end))
             end
 
@@ -322,7 +328,7 @@ local function Register(Cache, Model, OnDeath)
                 if not Model.Parent then OnDeath(Model) end
             end))
 
-            Cache[Model] = { Root = Root, Health = Health, GetHealth = GetHealth, Conns = Conns }
+            Cache[Model] = { Root = Root, Health = Health, GetHealth = GetHealth, IsAlive = IsAlive, Conns = Conns }
         end)
     end)
 end
@@ -330,8 +336,8 @@ end
 local function IsZombieDataLive(Data)
     if not Data or not Data.Root or not Data.Root.Parent then return false end
     if not Data.Health or not Data.Health.Parent then return false end
-    if not Data.GetHealth then return false end
-    return Data.GetHealth() > 0
+    if not Data.IsAlive then return false end
+    return Data.IsAlive()
 end
 
 -- Bootstrap zombies (survives Zombies folder being destroyed/replaced between matches)
@@ -478,7 +484,7 @@ local function ScanCache(Cache, Unregister, IgnoreCooldown)
 
     for Model, Data in pairs(Cache) do
         if not Model.Parent then Unregister(Model) continue end
-        if Data.GetHealth() <= 0 then Unregister(Model) continue end
+        if not Data.IsAlive() then Unregister(Model) continue end
         if not Data.Root or not Data.Root.Parent then Unregister(Model) continue end
         if Model:GetAttribute("Died") then Unregister(Model) continue end
         if Model:GetAttribute("Frozen") then continue end
@@ -525,7 +531,7 @@ local function IsZombieStillAlive(Model)
     local Data = GetTargetEntry(Model)
     if not Data then return false end
     if not Model.Parent then return false end
-    if Data.GetHealth() <= 0 then return false end
+    if not Data.IsAlive() then return false end
     if not Data.Root or not Data.Root.Parent then return false end
     if Model:GetAttribute("Died") then return false end
     return true
