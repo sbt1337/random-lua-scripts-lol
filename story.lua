@@ -185,15 +185,79 @@ local function SendWebhook(Title, Fields, Color)
     end)
 end
 
-local function SendError(Label, Err)
-    print("[StoryFarm] ERROR in " .. Label .. ": " .. tostring(Err))
-    SendWebhook("Error: " .. Label, {{ name = "Details", value = "```" .. tostring(Err) .. "```" }}, 15158332)
+local function SendError(Label, Err, Trace)
+    local Msg = "[StoryFarm] ERROR in " .. Label .. ": " .. tostring(Err)
+    print(Msg)
+    if Trace then print(Trace) end
+    SendWebhook("Error: " .. Label, {
+        { name = "Details", value = "```" .. tostring(Err) .. "```", inline = false },
+        { name = "Trace",   value = "```" .. tostring(Trace or "no trace"):sub(1, 1000) .. "```", inline = false },
+    }, 15158332)
 end
 
-local function Safe(Label, Fn)
-    local ok, err = pcall(Fn)
-    if not ok then SendError(Label, err) end
+-- xpcall handler captures stack trace at the point of the error (vs pcall which doesn't)
+local function TraceHandler(Err)
+    return tostring(Err), debug.traceback(nil, 2)
 end
+
+local function Safe(Label, Fn, ...)
+    local Args = { ... }
+    local ok, errOrResult, trace = xpcall(function()
+        return Fn(table.unpack(Args))
+    end, function(Err)
+        return tostring(Err) .. "\n" .. debug.traceback("", 2)
+    end)
+    if not ok then
+        SendError(Label, errOrResult, nil)
+    end
+    return ok, errOrResult
+end
+
+-- Wrap any function so it self-reports errors when called as a callback
+local function SafeWrap(Label, Fn)
+    return function(...)
+        local args = { ... }
+        local ok, err = xpcall(function() return Fn(table.unpack(args)) end, function(e)
+            return tostring(e) .. "\n" .. debug.traceback("", 2)
+        end)
+        if not ok then SendError(Label, err, nil) end
+    end
+end
+
+-- Global uncaught-error catcher: anything that escapes our Safe wrappers (Connect callbacks
+-- registered outside Safe, errors in deeply nested coroutines) lands here and gets webhooked.
+do
+    local LastReported = 0
+    local function OnGlobalError(Msg, Trace, _Script)
+        -- Throttle to one webhook per 2s so a tight error loop can't flood Discord
+        if tick() - LastReported < 2 then return end
+        LastReported = tick()
+        SendError("UncaughtScriptError", Msg, Trace)
+    end
+    pcall(function()
+        game:GetService("ScriptContext").Error:Connect(OnGlobalError)
+    end)
+    -- Roblox loadstring'd scripts may not get ScriptContext events; LogService is a fallback
+    pcall(function()
+        game:GetService("LogService").MessageOut:Connect(function(Msg, Type)
+            if Type == Enum.MessageType.MessageError then
+                if tick() - LastReported < 2 then return end
+                LastReported = tick()
+                SendError("LogServiceError", Msg, nil)
+            end
+        end)
+    end)
+end
+
+-- Startup ping so we can confirm error pipeline is alive
+task.spawn(function()
+    pcall(function()
+        SendWebhook("StoryFarm Started", {
+            { name = "Time",     value = os.date("%Y-%m-%d %H:%M:%S"), inline = true },
+            { name = "PlaceId",  value = tostring(game.PlaceId),       inline = true },
+        }, 3447003)
+    end)
+end)
 
 -- PgDn toggle
 UserInputService.InputBegan:Connect(function(Input, GameProcessed)
