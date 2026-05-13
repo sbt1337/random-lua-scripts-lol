@@ -17,7 +17,6 @@ local Attacking = false
 local AttackStartTime = 0
 local CurrentTarget = nil
 local CurrentTargetIsBoss = false
-local UndergroundAnchor = nil
 local SlotCooldownEnd = { 0, 0, 0, 0 } -- per-slot cooldown end time, set by UsedAbility event
 
 local Stats = {
@@ -31,7 +30,7 @@ local Stats = {
 local WEBHOOK = "https://discord.com/api/webhooks/1503857688118034662/H3y9e9EUyyZyRnKCQ-X_eIdRpejU8OwStg22dzEoycfGt__iAhRTYmnumIenbFWEckS7"
 local UNDERGROUND_Y = 10
 local ATTACK_HEIGHT = 5
-local MAX_ZOMBIE_RANGE = math.huge -- effectively uncapped so we follow zombies into new sections
+local MAX_ZOMBIE_RANGE = 10000 -- effectively uncapped so we follow zombies into new sections
 local ATTACK_COOLDOWN_PER_ZOMBIE = 0.3 -- just enough for death events to propagate
 local ATTACK_TIMEOUT = 4
 local STATS_INTERVAL = 1800
@@ -366,23 +365,36 @@ local function IsZombieStillAlive(Model)
 end
 
 -- Movement
+local function IsZombieDataLive(Data)
+    if not Data or not Data.Root or not Data.Root.Parent then return false end
+    if not Data.Health or not Data.Health.Parent then return false end
+    return Data.Health.Value > 0
+end
+
 local function GoUnderground()
     if not IsCharValid() then return end
-    local Anchor = CFrame.new(HRP.Position.X, HRP.Position.Y - UNDERGROUND_Y, HRP.Position.Z)
-    UndergroundAnchor = Anchor
-    HRP.CFrame = Anchor
+    HRP.CFrame = CFrame.new(HRP.Position.X, HRP.Position.Y - UNDERGROUND_Y, HRP.Position.Z)
     HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
 end
 
--- Hold underground while idle so we don't fall into the void between attack cycles
-RunService.Heartbeat:Connect(function()
-    if not Running then return end
-    if Attacking then return end
-    if not UndergroundAnchor then return end
-    if not IsCharValid() then return end
-    HRP.CFrame = UndergroundAnchor
-    HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-end)
+-- TP to under any tracked zombie/boss so we never sit in dead space between attacks
+local function GoUnderZombie()
+    if not IsCharValid() then return false end
+
+    for _, Cache in ipairs({ AliveBosses, AliveZombies }) do
+        for _, Data in pairs(Cache) do
+            if IsZombieDataLive(Data) then
+                local Pos = Data.Root.Position
+                HRP.CFrame = CFrame.new(Pos.X, Pos.Y - UNDERGROUND_Y, Pos.Z)
+                HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                return true
+            end
+        end
+    end
+
+    GoUnderground()
+    return false
+end
 
 local function GoToZombie(Root)
     if not IsCharValid() then return end
@@ -456,12 +468,6 @@ local function AnySlotReady()
     return false
 end
 
-local function IsZombieDataLive(Data)
-    if not Data or not Data.Root or not Data.Root.Parent then return false end
-    if not Data.Health or not Data.Health.Parent then return false end
-    return Data.Health.Value > 0
-end
-
 -- Pick a TP center that maximizes zombies inside AOE_RADIUS
 local function PickAttackCenter(Target)
     local TargetData = GetTargetEntry(Target)
@@ -528,16 +534,19 @@ task.spawn(function()
 
             -- Wait underground until abilities are off cooldown / state clears
             if IsActionBlocked() then
+                GoUnderZombie()
                 task.wait(0.1)
                 return
             end
             if not AnySlotReady() then
+                GoUnderZombie()
                 task.wait(0.1)
                 return
             end
 
             local Target, IsBoss = PickNearestZombie()
             if not Target then
+                GoUnderZombie()
                 task.wait(0.3)
                 return
             end
@@ -778,7 +787,6 @@ local function SetupCharacter(NewCharacter)
         Humanoid = NewCharacter:WaitForChild("Humanoid", 10)
         HRP = NewCharacter:WaitForChild("HumanoidRootPart", 10)
         Attacking = false
-        UndergroundAnchor = nil
         CurrentTarget = nil
         SlotCooldownEnd = { 0, 0, 0, 0 }
 
