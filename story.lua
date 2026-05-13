@@ -781,49 +781,52 @@ local function IsEscapePrompt(Prompt)
     return string.find(Combined, "escape", 1, true) ~= nil
 end
 
-local function FireEscapePrompt(Prompt)
-    if not Running then return end
-    if not Prompt or not Prompt.Parent then return end
-    if not IsEscapePrompt(Prompt) then return end
-    if FiredEscapePrompts[Prompt] and (tick() - FiredEscapePrompts[Prompt]) < 2 then return end
-
-    FiredEscapePrompts[Prompt] = tick()
-    print("[StoryFarm] Escape prompt: " .. Prompt.Name
-        .. " | action='" .. (Prompt.ActionText or "")
-        .. "' object='" .. (Prompt.ObjectText or "") .. "'")
-
-    if FireProx then
-        Safe("FireProx", function() FireProx(Prompt, 0) end)
-    else
-        -- Fallback: TP near it and let the player's own input handle it (rare path)
-        local Parent = Prompt.Parent
-        if Parent and Parent:IsA("BasePart") and IsCharValid() then
-            HRP.CFrame = Parent.CFrame + Vector3.new(0, 3, 0)
-        end
+local function ResolvePromptPart(Prompt)
+    local Parent = Prompt.Parent
+    if not Parent then return nil end
+    if Parent:IsA("BasePart") then return Parent end
+    if Parent:IsA("Model") then
+        return Parent.PrimaryPart or Parent:FindFirstChildWhichIsA("BasePart")
     end
+    return Parent:FindFirstChildWhichIsA("BasePart")
 end
 
+local function FindEscapePrompt()
+    for _, Inst in ipairs(workspace:GetDescendants()) do
+        if IsEscapePrompt(Inst) then return Inst end
+    end
+    return nil
+end
+
+-- Spam-TP to the prompt's parent part and fire the prompt every tick while one exists.
+-- Server may gate the prompt by distance, so being on top of it every frame is the safest play.
 task.spawn(function()
-    Safe("EscapePromptScanner", function()
-        for _, Inst in ipairs(workspace:GetDescendants()) do
-            if Inst:IsA("ProximityPrompt") then FireEscapePrompt(Inst) end
-        end
-
-        workspace.DescendantAdded:Connect(function(Inst)
-            if Inst:IsA("ProximityPrompt") then
-                task.wait(0.05) -- let ActionText/ObjectText settle if they're set after parent
-                FireEscapePrompt(Inst)
-            end
-        end)
-
-        -- Continuous sweep in case a prompt gets re-enabled instead of re-created
+    Safe("EscapePromptSpammer", function()
         while true do
-            task.wait(1)
+            task.wait(0.1)
             if not Running then continue end
-            for _, Inst in ipairs(workspace:GetDescendants()) do
-                if Inst:IsA("ProximityPrompt") and IsEscapePrompt(Inst) then
-                    FireEscapePrompt(Inst)
-                end
+            if not IsCharValid() then continue end
+
+            local Prompt = FindEscapePrompt()
+            if not Prompt then continue end
+
+            local Part = ResolvePromptPart(Prompt)
+            if Part then
+                HRP.CFrame = Part.CFrame + Vector3.new(0, 3, 0)
+                HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+            end
+
+            if FireProx then
+                Safe("FireProx", function() FireProx(Prompt, 0) end)
+            end
+
+            -- Log once per prompt instance
+            if not FiredEscapePrompts[Prompt] then
+                FiredEscapePrompts[Prompt] = tick()
+                print("[StoryFarm] Escape prompt: " .. Prompt.Name
+                    .. " | action='" .. (Prompt.ActionText or "")
+                    .. "' object='" .. (Prompt.ObjectText or "") .. "'"
+                    .. " | parent=" .. (Part and Part:GetFullName() or "?"))
             end
         end
     end)
