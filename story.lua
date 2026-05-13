@@ -186,6 +186,15 @@ local function UnregisterZombie(Model) Unregister(AliveZombies, Model) end
 local function UnregisterBoss(Model) Unregister(AliveBosses, Model) end
 
 -- Generic register - works for both zombies (in workspace.Zombies) and bosses (CollectionService tagged)
+local function ResolveRoot(Model)
+    return Model:FindFirstChild("HumanoidRootPart")
+        or Model.PrimaryPart
+        or Model:FindFirstChild("Torso")
+        or Model:FindFirstChild("UpperTorso")
+        or Model:FindFirstChild("Head")
+        or Model:FindFirstChildWhichIsA("BasePart")
+end
+
 local function Register(Cache, Model, OnDeath)
     if not Model:IsA("Model") then return end
     if Cache[Model] then return end
@@ -193,26 +202,28 @@ local function Register(Cache, Model, OnDeath)
     task.spawn(function()
         Safe("Register", function()
             local Config = Model:WaitForChild("Config", 10)
-            if not Config or not Model.Parent then return end
+            if not Config or not Model.Parent then
+                print("[StoryFarm] Register: no Config on " .. Model.Name)
+                return
+            end
 
             local Health = Config:WaitForChild("Health", 10)
-            if not Health or not Model.Parent then return end
+            if not Health or not Model.Parent then
+                print("[StoryFarm] Register: no Config.Health on " .. Model.Name)
+                return
+            end
 
-            local Root = Model:FindFirstChild("HumanoidRootPart")
+            local Root = ResolveRoot(Model)
             if not Root then
-                local Got
-                Got = Model.ChildAdded:Connect(function(Child)
-                    if Child.Name == "HumanoidRootPart" then
-                        Got:Disconnect()
-                        Root = Child
-                    end
-                end)
                 local Deadline = tick() + 5
                 while not Root and tick() < Deadline and Model.Parent do
                     task.wait(0.05)
+                    Root = ResolveRoot(Model)
                 end
-                if Got then pcall(function() Got:Disconnect() end) end
-                if not Root then return end
+                if not Root then
+                    print("[StoryFarm] Register: no root part on " .. Model.Name)
+                    return
+                end
             end
 
             if Health.Value <= 0 then return end
@@ -229,7 +240,7 @@ local function Register(Cache, Model, OnDeath)
             end))
 
             table.insert(Conns, Model.ChildRemoved:Connect(function(Child)
-                if Child == Root or Child.Name == "HumanoidRootPart" then OnDeath(Model) end
+                if Child == Root then OnDeath(Model) end
             end))
 
             table.insert(Conns, Model.AncestryChanged:Connect(function()
@@ -278,7 +289,7 @@ task.spawn(function()
             if Child.Name == "Zombies" then AttachZombieFolder(Child) end
         end)
 
-        -- Periodic rescan in case events miss (cheap safety net)
+        -- Periodic rescan + diagnostic (cheap safety net)
         while true do
             task.wait(5)
             local Folder = workspace:FindFirstChild("Zombies")
@@ -286,10 +297,18 @@ task.spawn(function()
                 AttachZombieFolder(Folder)
             end
             if Folder then
+                local InFolder, Tracked = 0, 0
                 for _, Child in ipairs(Folder:GetChildren()) do
-                    if Child:IsA("Model") and not AliveZombies[Child] then
-                        Register(AliveZombies, Child, UnregisterZombie)
+                    if Child:IsA("Model") then
+                        InFolder = InFolder + 1
+                        if not AliveZombies[Child] then
+                            Register(AliveZombies, Child, UnregisterZombie)
+                        end
                     end
+                end
+                for _ in pairs(AliveZombies) do Tracked = Tracked + 1 end
+                if InFolder > 0 and Tracked == 0 then
+                    print("[StoryFarm] Rescan: " .. InFolder .. " zombies in folder but 0 tracked")
                 end
             end
         end
