@@ -44,6 +44,7 @@ local Stats = {
 }
 
 local WEBHOOK = "https://discord.com/api/webhooks/1503857688118034662/H3y9e9EUyyZyRnKCQ-X_eIdRpejU8OwStg22dzEoycfGt__iAhRTYmnumIenbFWEckS7"
+local LOG_WEBHOOK = "https://discord.com/api/webhooks/1504232139749720074/D_Oe_5gwVDguw2eUeqZbKvpmxBLeajcEZxClzS4tvyAyS80zlL3iOLHsrpOTXUsh_gdu"
 local UNDERGROUND_Y = 10
 local ATTACK_HEIGHT = 5
 local MAX_ZOMBIE_RANGE = 10000 -- effectively uncapped so we follow zombies into new sections
@@ -73,6 +74,68 @@ local REBIRTH_STEPS = {
 }
 
 print("[StoryFarm] Loaded")
+
+-- Log webhook: batches print() output and flushes every 3s so we can read it on mobile.
+-- Discord allows ~30 req/min/webhook; batching keeps us well under that.
+local LogBuffer = {}
+local LogBufferLock = false
+local RawPrint = print
+
+local function FlushLogs()
+    if #LogBuffer == 0 then return end
+    if LogBufferLock then return end
+    LogBufferLock = true
+
+    -- Drain up to ~1800 chars (Discord field limit is 1024 per field, msg 2000)
+    local Lines = {}
+    local TotalLen = 0
+    while #LogBuffer > 0 do
+        local Line = LogBuffer[1]
+        if TotalLen + #Line + 1 > 1800 then break end
+        table.insert(Lines, Line)
+        TotalLen = TotalLen + #Line + 1
+        table.remove(LogBuffer, 1)
+    end
+
+    local Payload = table.concat(Lines, "\n")
+
+    pcall(function()
+        local Body = HttpService:JSONEncode({
+            username = "StoryFarm Logs",
+            content = "```" .. Payload .. "```",
+        })
+        local RequestFunc = (syn and syn.request) or request or http_request
+        if RequestFunc then
+            RequestFunc({
+                Url = LOG_WEBHOOK,
+                Method = "POST",
+                Headers = { ["Content-Type"] = "application/json" },
+                Body = Body,
+            })
+        end
+    end)
+
+    LogBufferLock = false
+end
+
+-- Override print so any existing print() call also goes to the log webhook.
+print = function(...)
+    local Args = { ... }
+    local Parts = {}
+    for i = 1, select("#", ...) do
+        Parts[i] = tostring(Args[i])
+    end
+    local Msg = table.concat(Parts, " ")
+    RawPrint(Msg) -- still goes to F9
+    table.insert(LogBuffer, os.date("%H:%M:%S") .. " " .. Msg)
+end
+
+task.spawn(function()
+    while true do
+        task.wait(3)
+        pcall(FlushLogs)
+    end
+end)
 
 -- Webhook
 local function SendWebhook(Title, Fields, Color)
@@ -489,7 +552,7 @@ local function ScanCache(Cache, Unregister, IgnoreCooldown)
         if not Model.Parent then Unregister(Model) continue end
         if not Data.Root or not Data.Root.Parent then Unregister(Model) continue end
         if Model:GetAttribute("Died") then Unregister(Model) continue end
-        if Model:GetAttribute("Frozen") then continue end
+        -- NOTE: Frozen attribute removed — game's own attacks still hit Frozen zombies.
         if not IgnoreCooldown and RecentlyAttacked[Model] and RecentlyAttacked[Model] > Now then continue end
 
         local Dx = Data.Root.Position.X - HRP.Position.X
@@ -729,8 +792,11 @@ task.spawn(function()
         if not IsCharValid() then task.wait(0.5) continue end
 
         Safe("AttackLoop", function()
-            -- Game finished / cutscene = wait it out
-            if workspace:FindFirstChild("GameFinished") or workspace:FindFirstChild("Cutscene") then
+            -- Game finished / cutscene / section transition = wait it out
+            if workspace:FindFirstChild("GameFinished")
+                or workspace:FindFirstChild("Cutscene")
+                or workspace:FindFirstChild("SwitchingSection") then
+                GoUnderZombie()
                 task.wait(1)
                 return
             end
@@ -800,9 +866,11 @@ task.spawn(function()
                 return
             end
 
-            -- Move horizontally under the cluster (stay underground for safety).
-            -- Picking the lowest-Y zombie via GoUnderZombie keeps us beneath real ground.
-            GoUnderZombie()
+            -- Surface AT the cluster center's Y (zombie level, not above them).
+            -- This ensures abilities actually reach zombies — purely underground attacks miss.
+            HRP.CFrame = CFrame.new(Center.X, Center.Y, Center.Z)
+            HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+            task.wait(0.03)
 
             if not IsZombieStillAlive(Target) and Hits <= 1 then
                 Stats.AttacksAborted = Stats.AttacksAborted + 1
