@@ -328,16 +328,19 @@ local function Register(Cache, Model, OnDeath)
                 if not Model.Parent then OnDeath(Model) end
             end))
 
-            Cache[Model] = { Root = Root, Health = Health, GetHealth = GetHealth, IsAlive = IsAlive, Conns = Conns }
+            Cache[Model] = { Model = Model, Root = Root, Health = Health, GetHealth = GetHealth, IsAlive = IsAlive, Conns = Conns }
         end)
     end)
 end
 
+-- Liveness check: relies on physical/attribute state, NOT the Health value (which has
+-- inverted/weird semantics per game). Death listeners attached at Register clean up
+-- the cache when a zombie actually dies.
 local function IsZombieDataLive(Data)
     if not Data or not Data.Root or not Data.Root.Parent then return false end
-    if not Data.Health or not Data.Health.Parent then return false end
-    if not Data.IsAlive then return false end
-    return Data.IsAlive()
+    if Data.Model and not Data.Model.Parent then return false end
+    if Data.Model and Data.Model:GetAttribute("Died") then return false end
+    return true
 end
 
 -- Bootstrap zombies (survives Zombies folder being destroyed/replaced between matches)
@@ -484,7 +487,6 @@ local function ScanCache(Cache, Unregister, IgnoreCooldown)
 
     for Model, Data in pairs(Cache) do
         if not Model.Parent then Unregister(Model) continue end
-        if not Data.IsAlive() then Unregister(Model) continue end
         if not Data.Root or not Data.Root.Parent then Unregister(Model) continue end
         if Model:GetAttribute("Died") then Unregister(Model) continue end
         if Model:GetAttribute("Frozen") then continue end
@@ -531,7 +533,6 @@ local function IsZombieStillAlive(Model)
     local Data = GetTargetEntry(Model)
     if not Data then return false end
     if not Model.Parent then return false end
-    if not Data.IsAlive() then return false end
     if not Data.Root or not Data.Root.Parent then return false end
     if Model:GetAttribute("Died") then return false end
     return true
