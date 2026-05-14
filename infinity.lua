@@ -9,9 +9,8 @@ local VirtualUser = game:GetService("VirtualUser")
 local LocalPlayer = Players.LocalPlayer
 
 -- ── Webhooks ──────────────────────────────────────────────────────────────────
-local WEBHOOK     = "https://discord.com/api/webhooks/1371564289376366592/CrY0XxM93cxB2jC0iUPimz0VBPt3VNRHRqBqbQBkaDhLvs9kl1KNg88OaqujCxEF6OXV"
-local LOG_WEBHOOK = "https://discord.com/api/webhooks/1504232139749720074/D_Oe_5gwVDguw2eUeqZbKvpmxBLeajcEZxClzS4tvyAyS80zlL3iOLHsrpOTXUsh_gdu"
-local RAW_URL     = "https://raw.githubusercontent.com/sbt1337/random-lua-scripts-lol/refs/heads/main/infinity.lua"
+local WEBHOOK = "https://discord.com/api/webhooks/1371564289376366592/CrY0XxM93cxB2jC0iUPimz0VBPt3VNRHRqBqbQBkaDhLvs9kl1KNg88OaqujCxEF6OXV"
+local RAW_URL = "https://raw.githubusercontent.com/sbt1337/random-lua-scripts-lol/refs/heads/main/infinity.lua"
 
 -- ── State ─────────────────────────────────────────────────────────────────────
 local Running = true
@@ -110,7 +109,8 @@ local function FireGadget()
     Interact:FireServer("Gadget", GadgetSlotKey, GadgetName, "Began")
     task.wait(0.08)
     Interact:FireServer("Gadget", GadgetSlotKey, GadgetName, "Released")
-    GadgetEnd = tick() + 1  -- soft lock 1s; server will enforce true CD via meter
+    GadgetEnd = tick() + 1
+    Stats.Gadgets += 1
 end
 
 local SlotNums = { Z = 1, X = 2, C = 3, V = 4 }
@@ -124,35 +124,40 @@ local function FireAbility(Key)
 end
 
 -- ── Stats ─────────────────────────────────────────────────────────────────────
-local Stats = { M1 = 0, Abilities = 0, Revives = 0, Cards = 0, StartTime = tick() }
+local Stats = {
+    Kills     = 0,
+    M1        = 0,
+    Abilities = 0,
+    Gadgets   = 0,
+    Revives   = 0,
+    Cards     = 0,
+    StartTime = tick(),
+    CoinsStart = LocalPlayer:GetAttribute("CoinsGained") or 0,
+}
 
--- ── Logging ───────────────────────────────────────────────────────────────────
-local LogBuffer, LogLock = {}, false
-local _print = print
-print = function(...)
-    _print(...)
-    local msg = os.date("%H:%M:%S") .. " " .. table.concat({...}, " ")
-    table.insert(LogBuffer, msg)
-    if #LogBuffer > 200 then table.remove(LogBuffer, 1) end
+-- Track kills by watching Config.Health hit 0 on zombies
+local function WatchZombieKill(Model)
+    local Config = Model:FindFirstChild("Config")
+    local Health = Config and Config:FindFirstChild("Health")
+    if not Health then return end
+    local Conn
+    Conn = Health:GetPropertyChangedSignal("Value"):Connect(function()
+        if Health.Value <= 0 then
+            Stats.Kills += 1
+            if Conn then Conn:Disconnect() end
+        end
+    end)
 end
 
+-- Attach watchers to zombies as they spawn
+workspace:WaitForChild("Zombies").ChildAdded:Connect(function(M)
+    if M:IsA("Model") then WatchZombieKill(M) end
+end)
+-- Catch any already-present zombies
 task.spawn(function()
-    while true do
-        task.wait(3)
-        if LogLock or #LogBuffer == 0 then continue end
-        LogLock = true
-        local Snap = LogBuffer ; LogBuffer = {}
-        LogLock = false
-        pcall(function()
-            HttpService:RequestAsync({
-                Url = LOG_WEBHOOK, Method = "POST",
-                Headers = { ["Content-Type"] = "application/json" },
-                Body = HttpService:JSONEncode({
-                    username = "InfinityFarm",
-                    content  = "```\n" .. table.concat(Snap, "\n"):sub(1, 1900) .. "\n```"
-                })
-            })
-        end)
+    local ZF = workspace:WaitForChild("Zombies")
+    for _, M in ipairs(ZF:GetChildren()) do
+        if M:IsA("Model") then WatchZombieKill(M) end
     end
 end)
 
@@ -380,38 +385,30 @@ task.spawn(function()
     end
 end)
 
--- ── Heartbeat every 30s ───────────────────────────────────────────────────────
+-- ── Stats webhook every 5 min ────────────────────────────────────────────────
 task.spawn(function()
     while Running do
-        task.wait(30)
-        Safe("Heartbeat", function()
-            local W    = workspace:GetAttribute("WavesPassed") or 0
-            local Up   = math.floor(tick() - Stats.StartTime)
-            local ZF   = workspace:FindFirstChild("Zombies")
-            local Alive = 0
-            if ZF then for _, M in ipairs(ZF:GetChildren()) do if IsAlive(M) then Alive += 1 end end end
-            print(string.format("[Heartbeat] wave=%d alive=%d m1=%d abil=%d revives=%d cards=%d up=%dm",
-                W, Alive, Stats.M1, Stats.Abilities, Stats.Revives, Stats.Cards, math.floor(Up/60)))
-        end)
-    end
-end)
-
--- ── Stats webhook every 30 min ────────────────────────────────────────────────
-task.spawn(function()
-    while Running do
-        task.wait(1800)
+        task.wait(300)
         Safe("StatsWebhook", function()
-            local W  = workspace:GetAttribute("WavesPassed") or 0
-            local Up = math.floor(tick() - Stats.StartTime)
-            SendWebhook("Infinity Stats", {
-                { name = "Wave",      value = tostring(W),                                                      inline = true },
-                { name = "Uptime",    value = math.floor(Up/3600).."h "..math.floor((Up%3600)/60).."m",        inline = true },
-                { name = "M1 Fired",  value = tostring(Stats.M1),                                               inline = true },
-                { name = "Abilities", value = tostring(Stats.Abilities),                                         inline = true },
-                { name = "Revives",   value = tostring(Stats.Revives),                                           inline = true },
-                { name = "Cards",     value = tostring(Stats.Cards),                                             inline = true },
-                { name = "Ability",   value = tostring(ShowcasingAbility),                                       inline = true },
+            local Wave    = workspace:GetAttribute("WavesPassed") or 0
+            local Up      = math.floor(tick() - Stats.StartTime)
+            local Uptime  = string.format("%dh %dm", math.floor(Up/3600), math.floor((Up%3600)/60))
+            local Coins   = (LocalPlayer:GetAttribute("CoinsGained") or 0) - Stats.CoinsStart
+            local CoinsStr = "$" .. tostring(math.floor(Coins))
+
+            SendWebhook("📊 Infinity Stats", {
+                { name = "Wave",       value = tostring(Wave),           inline = true },
+                { name = "Uptime",     value = Uptime,                   inline = true },
+                { name = "Kills",      value = tostring(Stats.Kills),    inline = true },
+                { name = "Coins Earned", value = CoinsStr,               inline = true },
+                { name = "Revives",    value = tostring(Stats.Revives),  inline = true },
+                { name = "Cards",      value = tostring(Stats.Cards),    inline = true },
+                { name = "Ability",    value = tostring(ShowcasingAbility), inline = true },
+                { name = "Gadget",     value = tostring(GadgetName),     inline = true },
             }, 3066993)
+
+            print(string.format("[Stats] wave=%d kills=%d coins=%s up=%s",
+                Wave, Stats.Kills, CoinsStr, Uptime))
         end)
     end
 end)
