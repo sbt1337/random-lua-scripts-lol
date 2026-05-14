@@ -556,10 +556,18 @@ end
 -- StaleTargets blacklist (populated when HP never moves across multiple attacks).
 local StaleTargets = setmetatable({}, { __mode = "k" })
 local function IsZombieDataLive(Data)
-    if not Data or not Data.Root or not Data.Root.Parent then return false end
-    if Data.Model and not Data.Model.Parent then return false end
-    if Data.Model and Data.Model:GetAttribute("Died") then return false end
-    if Data.Model and StaleTargets[Data.Model] then return false end
+    if not Data or not Data.Model then return false end
+    if not Data.Model.Parent then return false end
+    if Data.Model:GetAttribute("Died") then return false end
+    if StaleTargets[Data.Model] then return false end
+
+    -- Cached Root can go orphaned when HRP gets replaced on respawn — re-resolve from Model.
+    if not Data.Root or not Data.Root.Parent then
+        local Fresh = ResolveRoot(Data.Model)
+        if not Fresh then return false end
+        Data.Root = Fresh
+    end
+
     return true
 end
 
