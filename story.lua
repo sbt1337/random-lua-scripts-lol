@@ -551,13 +551,19 @@ local function Register(Cache, Model, OnDeath)
     end)
 end
 
--- Liveness check: relies on physical/attribute state, NOT the Health value (which has
--- inverted/weird semantics per game). Death listeners attached at Register clean up
--- the cache when a zombie actually dies.
+-- Liveness check. Game uses inverted Health semantics: Config.Health.Value <= 0 = ALIVE,
+-- > 0 = DEAD (per _LocalFX.lua:16505). So a "Titan" sitting at HP 660 is a corpse — we
+-- were targeting it for 10 minutes because we ignored the value entirely. Re-add the check.
 local function IsZombieDataLive(Data)
     if not Data or not Data.Root or not Data.Root.Parent then return false end
     if Data.Model and not Data.Model.Parent then return false end
     if Data.Model and Data.Model:GetAttribute("Died") then return false end
+
+    if Data.GetHealth then
+        local HP = Data.GetHealth()
+        if typeof(HP) == "number" and HP > 0 then return false end
+    end
+
     return true
 end
 
@@ -793,10 +799,7 @@ local function IsZombieStillAlive(Model)
     if not Model then return false end
     local Data = GetTargetEntry(Model)
     if not Data then return false end
-    if not Model.Parent then return false end
-    if not Data.Root or not Data.Root.Parent then return false end
-    if Model:GetAttribute("Died") then return false end
-    return true
+    return IsZombieDataLive(Data)
 end
 
 -- Movement
