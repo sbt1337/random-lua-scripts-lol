@@ -169,7 +169,7 @@ task.spawn(function()
                 for _, Desc in ipairs(Folder:GetDescendants()) do
                     if LooksLikeZombie(Desc) then InFolder = InFolder + 1 end
                 end
-                -- Raw dump of direct children (unfiltered) so we can see what's actually in there
+                -- Raw dump of direct children (unfiltered)
                 local Raw = {}
                 for _, C in ipairs(Folder:GetChildren()) do
                     table.insert(Raw, C.ClassName .. ":" .. C.Name)
@@ -215,9 +215,40 @@ task.spawn(function()
                 .. " matches=" .. Stats.MatchesCompleted
                 .. " sinceAttack=" .. SinceAttack .. "s"
                 .. " GF=" .. GF .. " SS=" .. SS .. " CS=" .. CS)
+            -- Dump child counts for all non-trivial workspace folders/models
+            local FolderDumps = {}
+            local ScanTargets = { "Zombies", "NPCs", "ZombieData", "Zones", "Platforms" }
+            for _, FName in ipairs(ScanTargets) do
+                local F = workspace:FindFirstChild(FName)
+                if F then
+                    local Count = 0
+                    local Sample = {}
+                    for _, C in ipairs(F:GetChildren()) do
+                        Count = Count + 1
+                        if #Sample < 4 then table.insert(Sample, C.ClassName .. ":" .. C.Name) end
+                    end
+                    if Count > 0 then
+                        table.insert(FolderDumps, FName .. "=" .. Count .. "[" .. table.concat(Sample, ",") .. "]")
+                    end
+                end
+            end
+            -- Also count models directly in workspace (like "marine zombie:Model")
+            local TopModels = {}
+            for _, C in ipairs(workspace:GetChildren()) do
+                if C:IsA("Model") and C.Name ~= "Map" then
+                    local Sub = 0
+                    for _ in ipairs(C:GetChildren()) do Sub = Sub + 1 end
+                    table.insert(TopModels, C.Name .. "(" .. Sub .. ")")
+                end
+            end
+
             print("[Heartbeat] locations=[" .. table.concat(Locations, ",") .. "]"
                 .. " tags=[" .. table.concat(TagCounts, ",") .. "]"
                 .. " zombiesFolder=[" .. ZombiesFolderDump .. "]")
+            if #FolderDumps > 0 or #TopModels > 0 then
+                print("[Heartbeat] folders=[" .. table.concat(FolderDumps, " | ") .. "]"
+                    .. " topModels=[" .. table.concat(TopModels, ",") .. "]")
+            end
             print("[Heartbeat] workspace=[" .. table.concat(AllChildren, ",") .. "]")
 
             -- Escalated alarm: if we've gone >2 min with no attack AND zombies are visible, webhook it
