@@ -551,19 +551,15 @@ local function Register(Cache, Model, OnDeath)
     end)
 end
 
--- Liveness check. Game uses inverted Health semantics: Config.Health.Value <= 0 = ALIVE,
--- > 0 = DEAD (per _LocalFX.lua:16505). So a "Titan" sitting at HP 660 is a corpse — we
--- were targeting it for 10 minutes because we ignored the value entirely. Re-add the check.
+-- Liveness check. Health semantics vary per enemy type (Phantom/Samurai alive at negative HP,
+-- Titan alive at positive HP), so we can't gate on the value. Rely on physical/attribute state +
+-- StaleTargets blacklist (populated when HP never moves across multiple attacks).
+local StaleTargets = setmetatable({}, { __mode = "k" })
 local function IsZombieDataLive(Data)
     if not Data or not Data.Root or not Data.Root.Parent then return false end
     if Data.Model and not Data.Model.Parent then return false end
     if Data.Model and Data.Model:GetAttribute("Died") then return false end
-
-    if Data.GetHealth then
-        local HP = Data.GetHealth()
-        if typeof(HP) == "number" and HP > 0 then return false end
-    end
-
+    if Data.Model and StaleTargets[Data.Model] then return false end
     return true
 end
 
@@ -1082,6 +1078,11 @@ task.spawn(function()
             local HPBefore = Humanoid and Humanoid.Health or 0
             local DamageStart = LastDamageAt
 
+            -- Stale-target detection: sample target's Config.Health before the swing.
+            -- If it doesn't change after the window, it's a corpse — blacklist after a few tries.
+            local TargetData = GetTargetEntry(Target)
+            local TargetHPBefore = TargetData and TargetData.GetHealth and TargetData.GetHealth() or nil
+
             -- Cycle through ready slots (1..3) until window closes or all on CD
             local Deadline = tick() + ATTACK_WINDOW
             local Fired = 0
@@ -1114,6 +1115,21 @@ task.spawn(function()
                 end
                 Fired = Fired + 1
                 task.wait(0.08)
+            end
+
+            -- Stale check: did the target's HP move during the swing window?
+            if Fired > 0 and TargetHPBefore and TargetData and TargetData.GetHealth then
+                local TargetHPAfter = TargetData.GetHealth()
+                if typeof(TargetHPAfter) == "number" and TargetHPAfter == TargetHPBefore then
+                    Target._StaleHits = (Target._StaleHits or 0) + 1
+                    if Target._StaleHits >= 4 then
+                        StaleTargets[Target] = true
+                        UnregisterZombie(Target)
+                        print("[StoryFarm] Blacklisted stale target: " .. Target.Name .. " (HP " .. tostring(TargetHPAfter) .. " unchanged across 4 swings)")
+                    end
+                else
+                    Target._StaleHits = 0
+                end
             end
 
             GoUnderZombie() -- back under the next target, not the (now-dead) cluster center
