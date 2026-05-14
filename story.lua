@@ -555,6 +555,7 @@ end
 -- Titan alive at positive HP), so we can't gate on the value. Rely on physical/attribute state +
 -- StaleTargets blacklist (populated when HP never moves across multiple attacks).
 local StaleTargets = setmetatable({}, { __mode = "k" })
+local StaleHits    = setmetatable({}, { __mode = "k" })
 local function IsZombieDataLive(Data)
     if not Data or not Data.Model then return false end
     if not Data.Model.Parent then return false end
@@ -1129,14 +1130,14 @@ task.spawn(function()
             if Fired > 0 and TargetHPBefore and TargetData and TargetData.GetHealth then
                 local TargetHPAfter = TargetData.GetHealth()
                 if typeof(TargetHPAfter) == "number" and TargetHPAfter == TargetHPBefore then
-                    Target._StaleHits = (Target._StaleHits or 0) + 1
-                    if Target._StaleHits >= 4 then
+                    StaleHits[Target] = (StaleHits[Target] or 0) + 1
+                    if StaleHits[Target] >= 4 then
                         StaleTargets[Target] = true
                         UnregisterZombie(Target)
                         print("[StoryFarm] Blacklisted stale target: " .. Target.Name .. " (HP " .. tostring(TargetHPAfter) .. " unchanged across 4 swings)")
                     end
                 else
-                    Target._StaleHits = 0
+                    StaleHits[Target] = nil
                 end
             end
 
