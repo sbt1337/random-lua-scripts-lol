@@ -50,8 +50,9 @@ local function IsCharValid()
         and Humanoid and Humanoid.Health > 0
 end
 
--- ── Ability info ──────────────────────────────────────────────────────────────
+-- ── Ability + Gadget info ─────────────────────────────────────────────────────
 local ShowcasingSlot, ShowcasingAbility
+local GadgetSlotKey, GadgetName
 
 local function RefreshAbility()
     local Data = LocalPlayer:FindFirstChild("Data")
@@ -68,21 +69,49 @@ local function RefreshAbility()
     end
 end
 
+local function RefreshGadget()
+    local Data = LocalPlayer:FindFirstChild("Data")
+    local GS   = Data and Data:FindFirstChild("GadgetSlots")
+    if not GS then return end
+    local ok, Decoded = pcall(function() return Utils.Decode(GS.Value) end)
+    if not ok then return end
+    for Key, Slot in pairs(Decoded) do
+        if Slot and Slot.Equipped then
+            GadgetSlotKey = Key
+            GadgetName    = Slot.Name
+            return
+        end
+    end
+end
+
 RefreshAbility()
+RefreshGadget()
 task.spawn(function()
     local Data = LocalPlayer:WaitForChild("Data")
     local AS   = Data:WaitForChild("AbilitySlots")
+    local GS   = Data:WaitForChild("GadgetSlots")
     AS:GetPropertyChangedSignal("Value"):Connect(RefreshAbility)
+    GS:GetPropertyChangedSignal("Value"):Connect(RefreshGadget)
 end)
 
 -- ── Cooldowns ─────────────────────────────────────────────────────────────────
-local SlotEnd = { Z = 0, X = 0, C = 0, V = 0 }
+local SlotEnd   = { Z = 0, X = 0, C = 0, V = 0 }
+local GadgetEnd = 0
 
 UsedAbility.OnClientEvent:Connect(function(_, Duration, _, SlotKey)
     if SlotKey and SlotEnd[SlotKey] ~= nil then
         SlotEnd[SlotKey] = tick() + (Duration or 0)
     end
 end)
+
+local function FireGadget()
+    if not GadgetSlotKey or not GadgetName then return end
+    if tick() < GadgetEnd then return end
+    Interact:FireServer("Gadget", GadgetSlotKey, GadgetName, "Began")
+    task.wait(0.08)
+    Interact:FireServer("Gadget", GadgetSlotKey, GadgetName, "Released")
+    GadgetEnd = tick() + 1  -- soft lock 1s; server will enforce true CD via meter
+end
 
 local SlotNums = { Z = 1, X = 2, C = 3, V = 4 }
 
@@ -344,6 +373,9 @@ task.spawn(function()
                     break
                 end
             end
+
+            -- Gadget (E) — fire whenever meter allows
+            FireGadget()
         end)
     end
 end)
@@ -388,11 +420,14 @@ end)
 task.spawn(function()
     task.wait(2)
     RefreshAbility()
+    RefreshGadget()
     local W = workspace:GetAttribute("WavesPassed") or 0
     SendWebhook("InfinityFarm v2 Started", {
         { name = "Wave",    value = tostring(W),                 inline = true },
         { name = "Ability", value = tostring(ShowcasingAbility), inline = true },
         { name = "Slot",    value = tostring(ShowcasingSlot),    inline = true },
+        { name = "Gadget",  value = tostring(GadgetName),        inline = true },
     }, 3066993)
-    print("[InfinityFarm] v2 started | ability=" .. tostring(ShowcasingAbility) .. " slot=" .. tostring(ShowcasingSlot))
+    print("[InfinityFarm] v2 started | ability=" .. tostring(ShowcasingAbility)
+        .. " gadget=" .. tostring(GadgetName))
 end)
