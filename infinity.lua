@@ -103,6 +103,18 @@ UsedAbility.OnClientEvent:Connect(function(_, Duration, _, SlotKey)
     end
 end)
 
+-- ── Stats (declared early so all functions can reference it) ──────────────────
+local FarmStats = {
+    Kills     = 0,
+    M1        = 0,
+    Abilities = 0,
+    Gadgets   = 0,
+    Revives   = 0,
+    Cards     = 0,
+    StartTime = tick(),
+    CoinsStart = LocalPlayer:GetAttribute("CoinsGained") or 0,
+}
+
 local function FireGadget()
     if not GadgetSlotKey or not GadgetName then return end
     if tick() < GadgetEnd then return end
@@ -110,7 +122,7 @@ local function FireGadget()
     task.wait(0.08)
     Interact:FireServer("Gadget", GadgetSlotKey, GadgetName, "Released")
     GadgetEnd = tick() + 1
-    Stats.Gadgets += 1
+    FarmFarmStats.Gadgets += 1
 end
 
 local SlotNums = { Z = 1, X = 2, C = 3, V = 4 }
@@ -123,18 +135,6 @@ local function FireAbility(Key)
     SlotEnd[Key] = tick() + 0.3
 end
 
--- ── Stats ─────────────────────────────────────────────────────────────────────
-local Stats = {
-    Kills     = 0,
-    M1        = 0,
-    Abilities = 0,
-    Gadgets   = 0,
-    Revives   = 0,
-    Cards     = 0,
-    StartTime = tick(),
-    CoinsStart = LocalPlayer:GetAttribute("CoinsGained") or 0,
-}
-
 -- Track kills by watching Config.Health hit 0 on zombies
 local function WatchZombieKill(Model)
     local Config = Model:FindFirstChild("Config")
@@ -143,7 +143,7 @@ local function WatchZombieKill(Model)
     local Conn
     Conn = Health:GetPropertyChangedSignal("Value"):Connect(function()
         if Health.Value <= 0 then
-            Stats.Kills += 1
+            FarmStats.Kills += 1
             if Conn then Conn:Disconnect() end
         end
     end)
@@ -266,48 +266,80 @@ end
 
 -- ── Auto Card Selection ───────────────────────────────────────────────────────
 -- Priority: ExtraLife (+1 Life) → Wealth (+5% Coins/EXP) → Damage (+5% DMG) → random
+-- Strategy: watch via both the remote event AND a UI poller so one always catches it.
 local CARD_PRIORITY = { "ExtraLife", "Wealth", "Damage" }
+local CardPicking   = false
 
-DrawCardRemote.OnClientEvent:Connect(function(Action, Cards)
-    -- Log raw event so we can diagnose format issues
-    print("[InfinityFarm] DrawCard event: action=" .. tostring(Action)
-        .. " cards=" .. tostring(Cards and #Cards or "nil"))
-    if Cards then
-        for i, C in ipairs(Cards) do
-            print("[InfinityFarm]   card[" .. i .. "] = " .. tostring(C and C.CardName or "?")
-                .. " lvl=" .. tostring(C and C.Level or "?"))
-        end
-    end
-
-    if Action ~= "Draw" or not Cards or #Cards == 0 then return end
-
+local function PickFromCards(Cards)
+    if CardPicking or not Cards or #Cards == 0 then return end
+    CardPicking = true
     task.spawn(function()
         task.wait(0.6)
 
-        -- Build offered set
         local Offered = {}
-        for _, Card in ipairs(Cards) do
-            if Card.CardName then Offered[Card.CardName] = true end
+        for _, C in ipairs(Cards) do
+            if C.CardName then Offered[C.CardName] = true end
         end
 
-        -- Pick by priority
         local Pick = nil
         for _, Want in ipairs(CARD_PRIORITY) do
             if Offered[Want] then Pick = Want break end
         end
         if not Pick then Pick = Cards[1].CardName end
 
-        print("[InfinityFarm] Selecting card: " .. tostring(Pick))
-        local ok, err = pcall(function()
-            FuncInteract:InvokeServer("DrawCard", Pick)
-        end)
-        if not ok then
-            print("[InfinityFarm] Card invoke failed: " .. tostring(err))
-        else
-            Stats.Cards += 1
-            print("[InfinityFarm] Card picked: " .. tostring(Pick))
-        end
+        print("[InfinityFarm] Picking card: " .. tostring(Pick))
+        pcall(function() FuncInteract:InvokeServer("DrawCard", Pick) end)
+        FarmStats.Cards += 1
+        task.wait(2)
+        CardPicking = false
     end)
+end
+
+-- Method 1: remote event
+DrawCardRemote.OnClientEvent:Connect(function(Action, Cards)
+    print("[InfinityFarm] DrawCard event=" .. tostring(Action) .. " count=" .. tostring(Cards and #Cards or 0))
+    if Action == "Draw" then PickFromCards(Cards) end
+end)
+
+-- Method 2: UI poller — directly click the card button in the HUD frame
+-- CardsPanel.lua: PlayerGui.HUD.Main.Cards.CardsFrame.Container children = card GuiObjects
+-- Each card has attribute "CardName" (set line 49) and fires FuncInteract on click.
+task.spawn(function()
+    local ok, CardsFrame = pcall(function()
+        return LocalPlayer.PlayerGui
+            :WaitForChild("HUD", 15)
+            :WaitForChild("Main", 5)
+            :WaitForChild("Cards", 5)
+            :WaitForChild("CardsFrame", 5)
+    end)
+    if not ok or not CardsFrame then
+        print("[InfinityFarm] CardsFrame not found, UI method disabled")
+        return
+    end
+
+    local Container = CardsFrame:WaitForChild("Container", 5)
+    if not Container then return end
+
+    while Running do
+        task.wait(0.3)
+        local Cards = Container:GetChildren()
+        -- Filter to actual card buttons (GuiObjects with CardName attribute)
+        local CardBtns = {}
+        for _, C in ipairs(Cards) do
+            if C:IsA("GuiObject") and C:GetAttribute("CardName") then
+                table.insert(CardBtns, C)
+            end
+        end
+        if #CardBtns == 0 then continue end
+
+        -- Build from UI state (avoids relying on remote args)
+        local UICards = {}
+        for _, Btn in ipairs(CardBtns) do
+            table.insert(UICards, { CardName = Btn:GetAttribute("CardName") })
+        end
+
+        PickFromCards(UICards)
+    end
 end)
 
 -- ── Wave skip ─────────────────────────────────────────────────────────────────
@@ -330,7 +362,7 @@ task.spawn(function()
             local C = LocalPlayer.Character
             if C and C:GetAttribute("CanRevive") then
                 Interact:FireServer("Revive")
-                Stats.Revives += 1
+                FarmStats.Revives += 1
                 print("[InfinityFarm] Revived")
             end
         end)
@@ -366,14 +398,14 @@ task.spawn(function()
             if Now - LastM1 >= 0.42 then
                 Interact:FireServer("M1", ShowcasingAbility, workspace:GetServerTimeNow())
                 LastM1 = Now
-                Stats.M1 += 1
+                FarmStats.M1 += 1
             end
 
             -- Ability rotation Z → X → C (one per tick to keep M1 tight)
             for _, Key in ipairs({ "Z", "X", "C" }) do
                 if tick() >= SlotEnd[Key] then
                     FireAbility(Key)
-                    Stats.Abilities += 1
+                    FarmStats.Abilities += 1
                     task.wait(0.05)
                     break
                 end
@@ -391,24 +423,24 @@ task.spawn(function()
         task.wait(300)
         Safe("StatsWebhook", function()
             local Wave    = workspace:GetAttribute("WavesPassed") or 0
-            local Up      = math.floor(tick() - Stats.StartTime)
+            local Up      = math.floor(tick() - FarmStats.StartTime)
             local Uptime  = string.format("%dh %dm", math.floor(Up/3600), math.floor((Up%3600)/60))
-            local Coins   = (LocalPlayer:GetAttribute("CoinsGained") or 0) - Stats.CoinsStart
+            local Coins   = (LocalPlayer:GetAttribute("CoinsGained") or 0) - FarmStats.CoinsStart
             local CoinsStr = "$" .. tostring(math.floor(Coins))
 
             SendWebhook("📊 Infinity Stats", {
                 { name = "Wave",       value = tostring(Wave),           inline = true },
                 { name = "Uptime",     value = Uptime,                   inline = true },
-                { name = "Kills",      value = tostring(Stats.Kills),    inline = true },
+                { name = "Kills",      value = tostring(FarmStats.Kills),    inline = true },
                 { name = "Coins Earned", value = CoinsStr,               inline = true },
-                { name = "Revives",    value = tostring(Stats.Revives),  inline = true },
-                { name = "Cards",      value = tostring(Stats.Cards),    inline = true },
+                { name = "Revives",    value = tostring(FarmStats.Revives),  inline = true },
+                { name = "Cards",      value = tostring(FarmStats.Cards),    inline = true },
                 { name = "Ability",    value = tostring(ShowcasingAbility), inline = true },
                 { name = "Gadget",     value = tostring(GadgetName),     inline = true },
             }, 3066993)
 
             print(string.format("[Stats] wave=%d kills=%d coins=%s up=%s",
-                Wave, Stats.Kills, CoinsStr, Uptime))
+                Wave, FarmStats.Kills, CoinsStr, Uptime))
         end)
     end
 end)
