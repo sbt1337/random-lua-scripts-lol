@@ -5,8 +5,6 @@
 --
 -- Assumes Saiyan (or any ability that auto-sets CanRevive on death) is equipped.
 
-if game.PlaceId == 140409475718339 then return end
-
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -370,6 +368,26 @@ end)
 
 -- Auto-revive: server sets CanRevive=true on Character (matches ClientUI.lua:1330
 -- and CharacterHandler/Client.lua:1756). Saiyan ult's revive phase triggers this.
+--
+-- Two layers:
+--   1. GetAttributeChangedSignal on the current Character (same as story_auto).
+--   2. A 0.5s polling fallback that re-resolves LocalPlayer.Character each tick.
+-- The poll catches cases where (a) CanRevive is set before our connect lands,
+-- (b) the character gets destroyed and replaced before the signal can fire, or
+-- (c) the captured Char goes stale after a respawn.
+local LastReviveAt = 0
+local function FireRevive(Source)
+    if tick() - LastReviveAt < 2 then return end
+    LastReviveAt = tick()
+    Safe("AutoRevive_" .. Source, function()
+        local Interact = GetInteract()
+        if not Interact then return end
+        print("[GairoFarm] [" .. Source .. "] CanRevive=true, firing Revive")
+        Interact:FireServer("Revive")
+        Stats.Revives = Stats.Revives + 1
+    end)
+end
+
 local ReviveAttrConn = nil
 local function HookReviveListener(Char)
     if ReviveAttrConn then
@@ -382,18 +400,31 @@ local function HookReviveListener(Char)
         if not Running then return end
         if not Char or not Char.Parent then return end
         if not Char:GetAttribute("CanRevive") then return end
-        Safe("AutoRevive", function()
-            local Interact = GetInteract()
-            if not Interact then return end
-            print("[GairoFarm] CanRevive=true, firing Revive")
-            Interact:FireServer("Revive")
-            Stats.Revives = Stats.Revives + 1
-        end)
+        FireRevive("signal")
     end
 
-    ReviveAttrConn = Char:GetAttributeChangedSignal("CanRevive"):Connect(TryRevive)
+    ReviveAttrConn = Char:GetAttributeChangedSignal("CanRevive"):Connect(function()
+        local Val = Char:GetAttribute("CanRevive")
+        print("[GairoFarm] CanRevive signal -> " .. tostring(Val))
+        TryRevive()
+    end)
+    print("[GairoFarm] Revive listener armed on " .. Char.Name)
     TryRevive()
 end
+
+-- Polling fallback. Re-fetches LocalPlayer.Character each tick so it survives
+-- character swaps (downed -> spectator -> revived) that would orphan the captured
+-- Char in HookReviveListener.
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if not Running then continue end
+        local Char = LocalPlayer.Character
+        if not Char or not Char.Parent then continue end
+        if not Char:GetAttribute("CanRevive") then continue end
+        FireRevive("poll")
+    end
+end)
 
 -- End-of-match: workspace.GameFinished folder appears when match ends
 -- (Create("GameFinished", "Folder", workspace) at _LocalFX.lua:15994).
