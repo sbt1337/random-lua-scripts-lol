@@ -838,6 +838,22 @@ task.spawn(function()
             else
                 StuckSince = nil
             end
+
+            -- Between-wave idle flush: if nothing is tracked AND nothing in folder AND we've
+            -- been idle >30s, wipe FailedRegister so next wave's models (often same instances)
+            -- aren't blocked by a previous wave's registration failure.
+            if Tracked == 0 and InFolder == 0 and (tick() - LastAttackAt) > 30 then
+                local Wiped = 0
+                for Model in pairs(FailedRegister) do
+                    FailedRegister[Model] = nil
+                    Wiped = Wiped + 1
+                end
+                for Model in pairs(StaleTargets) do StaleTargets[Model] = nil end
+                for Model in pairs(StaleHits)    do StaleHits[Model]    = nil end
+                if Wiped > 0 then
+                    print("[StoryFarm] Between-wave flush: cleared " .. Wiped .. " FailedRegister entries")
+                end
+            end
         end
     end)
 end)
