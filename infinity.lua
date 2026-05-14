@@ -122,7 +122,7 @@ local function FireGadget()
     task.wait(0.08)
     Interact:FireServer("Gadget", GadgetSlotKey, GadgetName, "Released")
     GadgetEnd = tick() + 1
-    FarmStats.Gadgets += 1
+    if FarmStats then FarmStats.Gadgets += 1 end
 end
 
 local SlotNums = { Z = 1, X = 2, C = 3, V = 4 }
@@ -143,7 +143,7 @@ local function WatchZombieKill(Model)
     local Conn
     Conn = Health:GetPropertyChangedSignal("Value"):Connect(function()
         if Health.Value <= 0 then
-            FarmStats.Kills += 1
+            if FarmStats then FarmStats.Kills += 1 end
             if Conn then Conn:Disconnect() end
         end
     end)
@@ -223,6 +223,7 @@ local function MakeReloadButton()
 
     btn.MouseButton1Click:Connect(function()
         Running = false
+        FarmStats = nil  -- kills all in-flight stat increments from stale closures
         print("[InfinityFarm] Reloading...")
         sg:Destroy()
         task.wait(0.3)
@@ -362,7 +363,7 @@ task.spawn(function()
             local C = LocalPlayer.Character
             if C and C:GetAttribute("CanRevive") then
                 Interact:FireServer("Revive")
-                FarmStats.Revives += 1
+                if FarmStats then FarmStats.Revives += 1 end
                 print("[InfinityFarm] Revived")
             end
         end)
@@ -398,14 +399,14 @@ task.spawn(function()
             if Now - LastM1 >= 0.42 then
                 Interact:FireServer("M1", ShowcasingAbility, workspace:GetServerTimeNow())
                 LastM1 = Now
-                FarmStats.M1 += 1
+                if FarmStats then FarmStats.M1 += 1 end
             end
 
             -- Ability rotation Z → X → C (one per tick to keep M1 tight)
             for _, Key in ipairs({ "Z", "X", "C" }) do
                 if tick() >= SlotEnd[Key] then
                     FireAbility(Key)
-                    FarmStats.Abilities += 1
+                    if FarmStats then FarmStats.Abilities += 1 end
                     task.wait(0.05)
                     break
                 end
