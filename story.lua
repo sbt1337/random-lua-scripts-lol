@@ -164,10 +164,18 @@ task.spawn(function()
             for _ in pairs(AliveZombies) do Z = Z + 1 end
             local Folder = workspace:FindFirstChild("Zombies")
             local InFolder = 0
+            local ZombiesFolderDump = "(no Zombies)"
             if Folder then
                 for _, Desc in ipairs(Folder:GetDescendants()) do
                     if LooksLikeZombie(Desc) then InFolder = InFolder + 1 end
                 end
+                -- Raw dump of direct children (unfiltered) so we can see what's actually in there
+                local Raw = {}
+                for _, C in ipairs(Folder:GetChildren()) do
+                    table.insert(Raw, C.ClassName .. ":" .. C.Name)
+                    if #Raw >= 10 then table.insert(Raw, "...") break end
+                end
+                ZombiesFolderDump = #Raw > 0 and table.concat(Raw, ", ") or "(empty)"
             end
             local SinceAttack = math.floor(tick() - LastAttackAt)
             local GF = workspace:FindFirstChild("GameFinished") and "Y" or "N"
@@ -208,7 +216,8 @@ task.spawn(function()
                 .. " sinceAttack=" .. SinceAttack .. "s"
                 .. " GF=" .. GF .. " SS=" .. SS .. " CS=" .. CS)
             print("[Heartbeat] locations=[" .. table.concat(Locations, ",") .. "]"
-                .. " tags=[" .. table.concat(TagCounts, ",") .. "]")
+                .. " tags=[" .. table.concat(TagCounts, ",") .. "]"
+                .. " zombiesFolder=[" .. ZombiesFolderDump .. "]")
             print("[Heartbeat] workspace=[" .. table.concat(AllChildren, ",") .. "]")
 
             -- Escalated alarm: if we've gone >2 min with no attack AND zombies are visible, webhook it
