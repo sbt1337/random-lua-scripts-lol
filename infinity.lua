@@ -231,32 +231,48 @@ local function PickNearest()
 end
 
 -- ── Auto Card Selection ───────────────────────────────────────────────────────
--- Priority per user request:
---   1. ExtraLife  → +1 Life
---   2. Wealth     → +5% Coins/EXP/Drops
---   3. Damage     → +5% DMG
---   else          → first card offered (random)
+-- Priority: ExtraLife (+1 Life) → Wealth (+5% Coins/EXP) → Damage (+5% DMG) → random
 local CARD_PRIORITY = { "ExtraLife", "Wealth", "Damage" }
 
 DrawCardRemote.OnClientEvent:Connect(function(Action, Cards)
-    if Action ~= "Draw" or not Cards or #Cards == 0 then return end
-    task.spawn(function()
-        task.wait(0.6)  -- let cards animate in
+    -- Log raw event so we can diagnose format issues
+    print("[InfinityFarm] DrawCard event: action=" .. tostring(Action)
+        .. " cards=" .. tostring(Cards and #Cards or "nil"))
+    if Cards then
+        for i, C in ipairs(Cards) do
+            print("[InfinityFarm]   card[" .. i .. "] = " .. tostring(C and C.CardName or "?")
+                .. " lvl=" .. tostring(C and C.Level or "?"))
+        end
+    end
 
+    if Action ~= "Draw" or not Cards or #Cards == 0 then return end
+
+    task.spawn(function()
+        task.wait(0.6)
+
+        -- Build offered set
         local Offered = {}
         for _, Card in ipairs(Cards) do
             if Card.CardName then Offered[Card.CardName] = true end
         end
 
+        -- Pick by priority
         local Pick = nil
         for _, Want in ipairs(CARD_PRIORITY) do
             if Offered[Want] then Pick = Want break end
         end
-        if not Pick then Pick = Cards[1].CardName end  -- random fallback
+        if not Pick then Pick = Cards[1].CardName end
 
-        pcall(function() FuncInteract:InvokeServer("DrawCard", Pick) end)
-        Stats.Cards += 1
-        print("[InfinityFarm] Card picked: " .. tostring(Pick))
+        print("[InfinityFarm] Selecting card: " .. tostring(Pick))
+        local ok, err = pcall(function()
+            FuncInteract:InvokeServer("DrawCard", Pick)
+        end)
+        if not ok then
+            print("[InfinityFarm] Card invoke failed: " .. tostring(err))
+        else
+            Stats.Cards += 1
+            print("[InfinityFarm] Card picked: " .. tostring(Pick))
+        end
     end)
 end)
 
