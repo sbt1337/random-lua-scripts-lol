@@ -54,7 +54,8 @@ local STATS_INTERVAL = 1800
 local AOE_RADIUS = 12 -- assumed melee/AOE hitbox radius for cluster-picking
 local ATTACK_WINDOW = 0.8 -- shorter surface window = less exposure
 local POST_DAMAGE_LOCKOUT = 1.5 -- stay underground this long after taking any hit
-local DAMAGE_ABORT_THRESHOLD = 1 -- HP drop in one tick that triggers immediate retreat
+local DAMAGE_ABORT_THRESHOLD = 0.15 -- fraction of MaxHealth lost during a swing that triggers retreat (was 1 HP literal — chip-hits in dense groups stalled us forever)
+local DAMAGE_GRACE_PERIOD    = 0.15 -- seconds after surfacing where damage doesn't abort the swing (lets the first ability actually fire)
 
 -- Live caches updated by events (not polling)
 -- [Model] = { Root = HRP, Health = IntValue, Conns = {connections} }
@@ -145,6 +146,14 @@ task.spawn(function()
     end
 end)
 
+-- Forward declarations. The heartbeat (below) and other early closures reference
+-- SendWebhook + LooksLikeZombie, but their `local function` decls live much later in
+-- the file. Without these forward `local`s, the closures resolve them as globals at
+-- parse time, get nil at call time, and the pcall silently eats the error every 30s.
+-- That's why the "Script Stalled" alarm webhook never fires when zombies are present.
+local SendWebhook
+local LooksLikeZombie
+
 -- Heartbeat: prints script state every 30s so we know it's still alive even if nothing else logs
 local LastStuckAlarm = 0
 task.spawn(function()
@@ -222,8 +231,8 @@ task.spawn(function()
     end
 end)
 
--- Webhook
-local function SendWebhook(Title, Fields, Color)
+-- Webhook (forward-declared at top so heartbeat can call it)
+SendWebhook = function(Title, Fields, Color)
     pcall(function()
         local Body = HttpService:JSONEncode({
             username = "StoryFarm",
@@ -451,14 +460,17 @@ local function ResolveHealth(Model)
 end
 
 -- Models we've tried to register and failed on — don't re-spam every rescan tick.
+-- Stores tick() at failure. Retry after FAILED_REGISTER_TTL so we recover from
+-- transient registration races (zombie spawned but Config.Health not populated yet).
 local FailedRegister = setmetatable({}, { __mode = "k" })
+local FAILED_REGISTER_TTL = 30
 -- Models currently being processed (15s health wait in flight) — dedup concurrent attempts.
 local RegisterInProgress = setmetatable({}, { __mode = "k" })
 
 local function Register(Cache, Model, OnDeath)
     if not Model:IsA("Model") then return end
     if Cache[Model] then return end
-    if FailedRegister[Model] then return end
+    if FailedRegister[Model] and tick() - FailedRegister[Model] < FAILED_REGISTER_TTL then return end
     if RegisterInProgress[Model] then return end -- another rescan tick is already trying
 
     -- Boss tag check (called repeatedly inside the retry loop since the server tags bosses a few seconds after parenting)
@@ -577,10 +589,15 @@ local ZombieFolderConns = {}
 local CurrentZombieFolder = nil
 
 -- Quick check: does this model look like a zombie (has Config.Health)?
--- Defined here (above AttachZombieFolder) so closures resolve it correctly.
-local function LooksLikeZombie(Inst)
+-- Forward-declared at the top of the file so earlier closures (heartbeat) resolve it.
+LooksLikeZombie = function(Inst)
     if not Inst:IsA("Model") then return false end
     if Players:GetPlayerFromCharacter(Inst) then return false end
+    -- Belt-and-braces: name match against any current player (covers race condition where
+    -- Character is parented before Player.Character property is set).
+    for _, Plr in ipairs(Players:GetPlayers()) do
+        if Inst.Name == Plr.Name then return false end
+    end
     if CollectionService:HasTag(Inst, "RaidBoss") then return false end
     if CollectionService:HasTag(Inst, "Boss") and Inst:GetAttribute("IsRaidBoss") then return false end
     local Pets  = workspace:FindFirstChild("Pets")
@@ -683,8 +700,28 @@ task.spawn(function()
                 if IsZombieDataLive(Data) then LiveTracked = LiveTracked + 1 end
             end
 
-            -- Hard-reset: if zombies exist but we can't track any live ones for 10s+, dump diagnostics + wipe
-            if InFolder > 0 and LiveTracked == 0 then
+            -- Count Humanoid-bearing models anywhere in workspace (excl. players/pets/alive)
+            -- so we can detect "stuck with 0 tracked" even when zombies aren't in workspace.Zombies.
+            local PetsF  = workspace:FindFirstChild("Pets")
+            local AliveF = workspace:FindFirstChild("Alive")
+            local InWorld = 0
+            for _, Inst in ipairs(workspace:GetDescendants()) do
+                if Inst:IsA("Model")
+                    and Inst:FindFirstChildOfClass("Humanoid")
+                    and not Players:GetPlayerFromCharacter(Inst)
+                    and not (PetsF  and Inst:IsDescendantOf(PetsF))
+                    and not (AliveF and Inst:IsDescendantOf(AliveF))
+                then
+                    local IsPlayer = false
+                    for _, Plr in ipairs(Players:GetPlayers()) do
+                        if Inst.Name == Plr.Name then IsPlayer = true break end
+                    end
+                    if not IsPlayer then InWorld = InWorld + 1 end
+                end
+            end
+
+            -- Hard-reset: if anything kill-able exists in world but we can't track any live ones for 10s+, dump + wipe
+            if (InFolder > 0 or InWorld > 0) and LiveTracked == 0 then
                 StuckSince = StuckSince or tick()
                 local StuckFor = math.floor(tick() - StuckSince)
                 print("[StoryFarm] Stuck: " .. InFolder .. " in folder, " .. Tracked
@@ -735,6 +772,7 @@ task.spawn(function()
 
                     SendWebhook("Tracker Stuck", {
                         { name = "Folder",   value = tostring(InFolder),    inline = true },
+                        { name = "InWorld",  value = tostring(InWorld),     inline = true },
                         { name = "Cached",   value = tostring(Tracked),     inline = true },
                         { name = "Live",     value = tostring(LiveTracked), inline = true },
                         { name = "StuckFor", value = StuckFor .. "s",       inline = true },
@@ -749,7 +787,7 @@ task.spawn(function()
                 end
 
                 if tick() - StuckSince >= 10 then
-                    print("[StoryFarm] HARD RESET zombie tracker")
+                    print("[StoryFarm] HARD RESET zombie tracker (clearing blacklists too)")
                     for _, Conn in ipairs(ZombieFolderConns) do
                         pcall(function() Conn:Disconnect() end)
                     end
@@ -760,6 +798,11 @@ task.spawn(function()
                         end
                         AliveZombies[Model] = nil
                     end
+                    -- Wipe blacklists too: a hard reset that doesn't clear FailedRegister
+                    -- just slams into the same wall it was supposed to break.
+                    for Model in pairs(FailedRegister) do FailedRegister[Model] = nil end
+                    for Model in pairs(StaleTargets)   do StaleTargets[Model]   = nil end
+                    for Model in pairs(StaleHits)      do StaleHits[Model]      = nil end
                     CurrentZombieFolder = nil
                     AttachZombieFolder(Folder)
                     StuckSince = nil
@@ -1091,6 +1134,8 @@ task.spawn(function()
             if not Center then
                 Stats.AttacksAborted = Stats.AttacksAborted + 1
                 GoUnderground()
+                CurrentTarget = nil
+                CurrentTargetIsBoss = false
                 Attacking = false
                 return
             end
@@ -1104,13 +1149,18 @@ task.spawn(function()
             if not IsZombieStillAlive(Target) and Hits <= 1 then
                 Stats.AttacksAborted = Stats.AttacksAborted + 1
                 GoUnderground()
+                CurrentTarget = nil
+                CurrentTargetIsBoss = false
                 Attacking = false
                 return
             end
 
-            -- Snapshot HP before surfacing — any drop = abort and bail
-            local HPBefore = Humanoid and Humanoid.Health or 0
-            local DamageStart = LastDamageAt
+            -- Snapshot HP before surfacing. Damage abort is now scaled by MaxHP and gated by
+            -- a grace period — chip-damage on the first frame can no longer kill the swing.
+            local HPBefore   = Humanoid and Humanoid.Health or 0
+            local MaxHP      = (Humanoid and Humanoid.MaxHealth and Humanoid.MaxHealth > 0) and Humanoid.MaxHealth or 100
+            local DamageCap  = MaxHP * DAMAGE_ABORT_THRESHOLD
+            local GraceEnd   = tick() + DAMAGE_GRACE_PERIOD
 
             -- Stale-target detection: sample target's Config.Health before the swing.
             -- If it doesn't change after the window, it's a corpse — blacklist after a few tries.
@@ -1123,11 +1173,14 @@ task.spawn(function()
             while tick() < Deadline do
                 if not IsCharValid() then break end
 
-                -- Mid-attack damage abort
-                if LastDamageAt ~= DamageStart then break end
-                if Humanoid and (HPBefore - Humanoid.Health) >= DAMAGE_ABORT_THRESHOLD then
-                    LastDamageAt = tick()
-                    break
+                -- Mid-attack damage abort: only after the grace period, and only on cumulative
+                -- damage that exceeds MaxHP * DAMAGE_ABORT_THRESHOLD. The old check bailed on
+                -- a single 1-HP chip, leaving Fired=0 and the stale-target detector blind.
+                if tick() > GraceEnd then
+                    if Humanoid and (HPBefore - Humanoid.Health) >= DamageCap then
+                        LastDamageAt = tick()
+                        break
+                    end
                 end
 
                 if IsActionBlocked() then
@@ -1167,6 +1220,8 @@ task.spawn(function()
             end
 
             GoUnderZombie() -- back under the next target, not the (now-dead) cluster center
+            CurrentTarget = nil
+            CurrentTargetIsBoss = false
             task.wait(0.05)
             Attacking = false
         end)
