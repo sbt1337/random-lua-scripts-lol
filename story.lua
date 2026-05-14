@@ -487,6 +487,8 @@ local function ResolveHealth(Model)
     return nil
 end
 
+-- Permanent blacklist for models we know are bosses/unregisterable and should never retry.
+local PermanentBlacklist = setmetatable({}, { __mode = "k" })
 -- Models we've tried to register and failed on — don't re-spam every rescan tick.
 -- Stores tick() at failure. Retry after FAILED_REGISTER_TTL so we recover from
 -- transient registration races (zombie spawned but Config.Health not populated yet).
@@ -498,6 +500,7 @@ local RegisterInProgress = setmetatable({}, { __mode = "k" })
 local function Register(Cache, Model, OnDeath)
     if not Model:IsA("Model") then return end
     if Cache[Model] then return end
+    if PermanentBlacklist[Model] then return end
     if FailedRegister[Model] and tick() - FailedRegister[Model] < FAILED_REGISTER_TTL then return end
     if RegisterInProgress[Model] then return end -- another rescan tick is already trying
 
@@ -528,10 +531,17 @@ local function Register(Cache, Model, OnDeath)
             end
 
             if not Health then
-                FailedRegister[Model] = tick()
-                -- Silence the log if the model is gone (server briefly spawned/removed it) or it's now tagged as boss
-                if Model.Parent and not IsTaggedBoss() then
-                    print("[StoryFarm] Register: no Health on " .. Model.Name .. " (blacklisted)")
+                -- Permanently blacklist if boss-tagged or known boss name — these will never have Health.
+                local IsBossNow = IsTaggedBoss()
+                    or Model.Name:find("Upper Moon") or Model.Name:find("Lower Moon")
+                    or Model.Name:find("Akaza") or Model.Name:find("Yuji")
+                if IsBossNow then
+                    PermanentBlacklist[Model] = true
+                else
+                    FailedRegister[Model] = tick()
+                    if Model.Parent then
+                        print("[StoryFarm] Register: no Health on " .. Model.Name .. " (blacklisted)")
+                    end
                 end
                 return
             end
@@ -845,8 +855,12 @@ task.spawn(function()
             if Tracked == 0 and InFolder == 0 and (tick() - LastAttackAt) > 30 then
                 local Wiped = 0
                 for Model in pairs(FailedRegister) do
-                    FailedRegister[Model] = nil
-                    Wiped = Wiped + 1
+                    -- Keep boss-named entries — they'll go to PermanentBlacklist next time they're seen.
+                    -- Only flush regular zombie registration failures.
+                    if not PermanentBlacklist[Model] then
+                        FailedRegister[Model] = nil
+                        Wiped = Wiped + 1
+                    end
                 end
                 for Model in pairs(StaleTargets) do StaleTargets[Model] = nil end
                 for Model in pairs(StaleHits)    do StaleHits[Model]    = nil end
@@ -1143,8 +1157,26 @@ task.spawn(function()
 
             local Target, IsBoss = PickNearestZombie()
             if not Target then
-                GoUnderZombie()
-                task.wait(0.3)
+                -- No zombies at all: surface near the spawn point so the game's proximity-based
+                -- spawn system can trigger. Underground = no zone coverage = zombies never come.
+                local NoTargetIdle = tick() - LastAttackAt
+                if NoTargetIdle > 5 then
+                    local MapSpawn = workspace:FindFirstChild("Map")
+                        and workspace.Map:FindFirstChild("Spawns")
+                    local SpawnPart = MapSpawn and MapSpawn:FindFirstChildOfClass("Part")
+                    if SpawnPart then
+                        HRP.CFrame = SpawnPart.CFrame + Vector3.new(0, 5, 0)
+                        HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                    else
+                        -- Fallback: just surface at current XZ
+                        HRP.CFrame = CFrame.new(HRP.Position.X, 10, HRP.Position.Z)
+                        HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                    end
+                    task.wait(1)
+                else
+                    GoUnderZombie()
+                    task.wait(0.3)
+                end
                 return
             end
 
