@@ -215,39 +215,27 @@ task.spawn(function()
                 .. " matches=" .. Stats.MatchesCompleted
                 .. " sinceAttack=" .. SinceAttack .. "s"
                 .. " GF=" .. GF .. " SS=" .. SS .. " CS=" .. CS)
-            -- Dump child counts for all non-trivial workspace folders/models
+            -- Dump every direct workspace child that has any children, with a 4-item sample.
+            -- This catches unnamed Folder:Folder entries and workspace.Map too.
             local FolderDumps = {}
-            local ScanTargets = { "Zombies", "NPCs", "ZombieData", "Zones", "Platforms" }
-            for _, FName in ipairs(ScanTargets) do
-                local F = workspace:FindFirstChild(FName)
-                if F then
-                    local Count = 0
-                    local Sample = {}
-                    for _, C in ipairs(F:GetChildren()) do
-                        Count = Count + 1
-                        if #Sample < 4 then table.insert(Sample, C.ClassName .. ":" .. C.Name) end
-                    end
-                    if Count > 0 then
-                        table.insert(FolderDumps, FName .. "=" .. Count .. "[" .. table.concat(Sample, ",") .. "]")
-                    end
-                end
-            end
-            -- Also count models directly in workspace (like "marine zombie:Model")
-            local TopModels = {}
             for _, C in ipairs(workspace:GetChildren()) do
-                if C:IsA("Model") and C.Name ~= "Map" then
-                    local Sub = 0
-                    for _ in ipairs(C:GetChildren()) do Sub = Sub + 1 end
-                    table.insert(TopModels, C.Name .. "(" .. Sub .. ")")
+                if C:IsA("Folder") or C:IsA("Model") then
+                    local Kids = C:GetChildren()
+                    if #Kids > 0 then
+                        local Sample = {}
+                        for i = 1, math.min(4, #Kids) do
+                            table.insert(Sample, Kids[i].ClassName .. ":" .. Kids[i].Name)
+                        end
+                        table.insert(FolderDumps, C.Name .. "(" .. #Kids .. ")[" .. table.concat(Sample, ",") .. "]")
+                    end
                 end
             end
 
             print("[Heartbeat] locations=[" .. table.concat(Locations, ",") .. "]"
                 .. " tags=[" .. table.concat(TagCounts, ",") .. "]"
                 .. " zombiesFolder=[" .. ZombiesFolderDump .. "]")
-            if #FolderDumps > 0 or #TopModels > 0 then
-                print("[Heartbeat] folders=[" .. table.concat(FolderDumps, " | ") .. "]"
-                    .. " topModels=[" .. table.concat(TopModels, ",") .. "]")
+            if #FolderDumps > 0 then
+                print("[Heartbeat] allFolders=[" .. table.concat(FolderDumps, " | ") .. "]")
             end
             print("[Heartbeat] workspace=[" .. table.concat(AllChildren, ",") .. "]")
 
