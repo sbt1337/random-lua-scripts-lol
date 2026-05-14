@@ -590,6 +590,10 @@ local function LooksLikeZombie(Inst)
 
     local Config = Inst:FindFirstChild("Config")
     if Config and Config:FindFirstChild("Health") then return true end
+    -- Fallback: section variants without Config.Health but with a Humanoid + HRP still kill-able
+    if Inst:FindFirstChildOfClass("Humanoid") and Inst:FindFirstChild("HumanoidRootPart") then
+        return true
+    end
     return false
 end
 
@@ -709,6 +713,26 @@ task.spawn(function()
 
                 -- Throttle webhook to once per 30s when stuck so we don't flood
                 if StuckFor % 30 == 0 then
+                    -- Discovery: scan workspace for ANY Model with a Humanoid (excluding players/pets/alive)
+                    -- and report parent path so we can see where section variants actually live.
+                    local Found, FoundCount = {}, 0
+                    local PetsF  = workspace:FindFirstChild("Pets")
+                    local AliveF = workspace:FindFirstChild("Alive")
+                    for _, Inst in ipairs(workspace:GetDescendants()) do
+                        if FoundCount >= 12 then break end
+                        if Inst:IsA("Model")
+                            and Inst:FindFirstChildOfClass("Humanoid")
+                            and not Players:GetPlayerFromCharacter(Inst)
+                            and not (PetsF  and Inst:IsDescendantOf(PetsF))
+                            and not (AliveF and Inst:IsDescendantOf(AliveF))
+                        then
+                            local ParentPath = Inst.Parent and Inst.Parent:GetFullName() or "?"
+                            FoundCount = FoundCount + 1
+                            table.insert(Found, Inst.Name .. " <- " .. ParentPath)
+                        end
+                    end
+                    local Discovery = #Found > 0 and table.concat(Found, "\n") or "(none with Humanoid)"
+
                     SendWebhook("Tracker Stuck", {
                         { name = "Folder",   value = tostring(InFolder),    inline = true },
                         { name = "Cached",   value = tostring(Tracked),     inline = true },
@@ -720,6 +744,7 @@ task.spawn(function()
                         { name = "Root",     value = RootStr, inline = true },
                         { name = "Died",     value = DiedStr, inline = true },
                         { name = "Children", value = "```" .. ChildList .. "```", inline = false },
+                        { name = "Discovery (Models w/ Humanoid)", value = "```" .. Discovery .. "```", inline = false },
                     }, 15158332)
                 end
 
