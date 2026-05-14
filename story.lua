@@ -565,6 +565,23 @@ end
 local ZombieFolderConns = {}
 local CurrentZombieFolder = nil
 
+-- Quick check: does this model look like a zombie (has Config.Health)?
+-- Defined here (above AttachZombieFolder) so closures resolve it correctly.
+local function LooksLikeZombie(Inst)
+    if not Inst:IsA("Model") then return false end
+    if Players:GetPlayerFromCharacter(Inst) then return false end
+    if CollectionService:HasTag(Inst, "RaidBoss") then return false end
+    if CollectionService:HasTag(Inst, "Boss") and Inst:GetAttribute("IsRaidBoss") then return false end
+    local Pets  = workspace:FindFirstChild("Pets")
+    local Alive = workspace:FindFirstChild("Alive")
+    if Pets  and Inst:IsDescendantOf(Pets)  then return false end
+    if Alive and Inst:IsDescendantOf(Alive) then return false end
+
+    local Config = Inst:FindFirstChild("Config")
+    if Config and Config:FindFirstChild("Health") then return true end
+    return false
+end
+
 local function AttachZombieFolder(Folder)
     if CurrentZombieFolder == Folder then return end
 
@@ -595,23 +612,6 @@ local function AttachZombieFolder(Folder)
     end))
 
     print("[StoryFarm] Attached to Zombies (Model). Initial descendants: " .. #Folder:GetDescendants())
-end
-
--- Quick check: does this model look like a zombie (has Config.Health or Humanoid)?
-local function LooksLikeZombie(Inst)
-    if not Inst:IsA("Model") then return false end
-    -- Skip our own character and other players
-    if Players:GetPlayerFromCharacter(Inst) then return false end
-    -- Skip tagged bosses (boss tracker handles them)
-    if CollectionService:HasTag(Inst, "RaidBoss") then return false end
-    if CollectionService:HasTag(Inst, "Boss") and Inst:GetAttribute("IsRaidBoss") then return false end
-    -- Skip pets (workspace.Pets path)
-    if Inst:IsDescendantOf(workspace:FindFirstChild("Pets") or Inst) then return false end
-    if Inst:IsDescendantOf(workspace:FindFirstChild("Alive") or Inst) then return false end
-
-    local Config = Inst:FindFirstChild("Config")
-    if Config and Config:FindFirstChild("Health") then return true end
-    return false
 end
 
 -- Workspace-wide watcher: catches zombies parented to ANYWHERE in workspace, not just workspace.Zombies.
