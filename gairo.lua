@@ -5,6 +5,8 @@
 --
 -- Assumes Saiyan (or any ability that auto-sets CanRevive on death) is equipped.
 
+if game.PlaceId == 140409475718339 then return end
+
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
