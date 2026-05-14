@@ -122,7 +122,7 @@ local function FireGadget()
     task.wait(0.08)
     Interact:FireServer("Gadget", GadgetSlotKey, GadgetName, "Released")
     GadgetEnd = tick() + 1
-    FarmFarmStats.Gadgets += 1
+    FarmStats.Gadgets += 1
 end
 
 local SlotNums = { Z = 1, X = 2, C = 3, V = 4 }
@@ -290,7 +290,7 @@ local function PickFromCards(Cards)
         print("[InfinityFarm] Picking card: " .. tostring(Pick))
         pcall(function() FuncInteract:InvokeServer("DrawCard", Pick) end)
         FarmStats.Cards += 1
-        task.wait(2)
+        task.wait(6)  -- card dismiss animation takes ~1.5s; 6s gives plenty of buffer
         CardPicking = false
     end)
 end
