@@ -49,7 +49,8 @@ local BLOCKING_STATES = { "LightAttack", "NoAttack", "Action", "Stun", "UsingMov
 local Running = true
 local ClearingForceField = false   -- true while walking off spawn FF; pauses TPs
 local SlotCooldownEnd = { 0, 0, 0, 0, 0 }
-local GadgetCooldownEnd = 0
+local GadgetCooldownEnd   = 0
+local SpecialCooldownEnd  = 0
 local LastAttackAt = tick()
 
 local Stats = {
@@ -311,6 +312,22 @@ local function GetGadgetInfo()
     return nil, nil
 end
 
+-- Special ability (Q key) — lives in Data.SpecialSlot, fired as "Special" event
+local function GetSpecialInfo()
+    local Data = LocalPlayer:FindFirstChild("Data")
+    if not Data then return nil, nil end
+    local SS = Data:FindFirstChild("SpecialSlot")
+    if not SS then return nil, nil end
+    local ok, Decoded = pcall(HttpService.JSONDecode, HttpService, SS.Value)
+    if not ok or not Decoded then return nil, nil end
+    for SlotName, SlotData in pairs(Decoded) do
+        if SlotData and SlotData.Equipped then
+            return SlotName, SlotData.Name
+        end
+    end
+    return nil, nil
+end
+
 -- Authoritative per-slot cooldown from server
 task.spawn(function()
     Safe("CooldownHook", function()
@@ -320,8 +337,11 @@ task.spawn(function()
 
         UsedAbility.OnClientEvent:Connect(function(_, Duration, _Name, KeyIndex)
             if type(Duration) ~= "number" then return end
-            if type(KeyIndex) ~= "number" or KeyIndex < 1 or KeyIndex > SLOT_COUNT then return end
-            SlotCooldownEnd[KeyIndex] = tick() + Duration
+            if type(KeyIndex) == "number" and KeyIndex >= 1 and KeyIndex <= SLOT_COUNT then
+                SlotCooldownEnd[KeyIndex] = tick() + Duration
+            elseif KeyIndex == "Special" or KeyIndex == "Q" then
+                SpecialCooldownEnd = tick() + Duration
+            end
         end)
         print("[GairoFarm] Cooldown hook armed")
     end)
@@ -395,6 +415,19 @@ task.spawn(function()
                     Interact:FireServer("Gadget", GadgetSlot, GadgetName, "Released")
                     GadgetCooldownEnd = tick() + GADGET_COOLDOWN
                     Stats.GadgetsFired = Stats.GadgetsFired + 1
+                end
+            end
+
+            -- Special ability (Q key) — Data.SpecialSlot, "Special" Interact event
+            if tick() >= SpecialCooldownEnd then
+                local SpecSlot, SpecName = GetSpecialInfo()
+                if SpecSlot and SpecName then
+                    Interact:FireServer("Special", SpecSlot, SpecName, "Began")
+                    task.wait(0.05)
+                    Interact:FireServer("Special", SpecSlot, SpecName, "Released")
+                    SpecialCooldownEnd = tick() + 1   -- soft gate; server sends real CD
+                    Stats.AbilitiesFired = Stats.AbilitiesFired + 1
+                    LastAttackAt = tick()
                 end
             end
         end)
