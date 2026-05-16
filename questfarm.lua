@@ -78,11 +78,19 @@ local function TPUnderEnemy(hrp)
     r.CFrame = CFrame.new(hrp.Position - Vector3.new(0, UNDER_DEPTH, 0), hrp.Position)
 end
 
+-- Rate-limited kagune equip. ToggleWeapon is literally a toggle — calling it twice
+-- in rapid succession equips then immediately unequips. isUsingWeapon replicates
+-- from the server so there's a delay before the client sees the update.
+-- We gate calls to once every 4 seconds so we never accidentally toggle it off.
+local LastEquipAttempt = 0
 local function EquipKagune()
-    if not LocalPlayer:GetAttribute("isUsingWeapon") and _G.ToggleWeapon then
-        _G.ToggleWeapon()
-        task.wait(0.5)
-    end
+    if LocalPlayer:GetAttribute("isUsingWeapon") then return end
+    if not _G.ToggleWeapon then return end
+    if tick() - LastEquipAttempt < 4 then return end
+    LastEquipAttempt = tick()
+    _G.ToggleWeapon()
+    -- wait for attribute to replicate before next check
+    task.wait(1.5)
 end
 
 local function GetLoadedSkillNames()
@@ -180,12 +188,16 @@ QuestBridge:Connect(function(data)
     end
 end)
 
--- Re-equip on respawn
+-- Re-equip on respawn.
+-- Weapon.lua sets an internal 3-second toggle cooldown (u19) on CharacterAdded,
+-- so we must wait >3s before ToggleWeapon will do anything. We also reset
+-- LastEquipAttempt so the rate-limiter doesn't block the first attempt.
 LocalPlayer.CharacterAdded:Connect(function()
-    task.wait(3)
+    task.wait(4)  -- outlast Weapon.lua's 3s u19 cooldown
     repeat task.wait(0.2) until LocalPlayer:GetAttribute("Loaded")
+    LastEquipAttempt = 0  -- reset rate-limiter so we try immediately
     EquipKagune()
-    print("[QF] Respawned — kagune equipped")
+    print("[QF] Respawned — kagune equip attempted")
 end)
 
 -- Init gate
