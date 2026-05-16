@@ -12,8 +12,8 @@ local ReplicaCtrl = require(ReplicatedStorage.ReplicaController)
 
 -- !! All ClientBridge / ReferenceBridge calls happen INSIDE init, after identifierStorage
 -- is confirmed loaded. Calling them before causes the 3-second "bridge not found" timeout.
-local QuestBridge    = nil   -- ClientBridge("Quest")
-local UseSkillBridge = nil   -- ReferenceBridge("UseSkill")
+local QuestBridge    = nil   -- ClientBridge("QuestData")
+local UseSkillRemote = nil   -- raw RemoteFunction: Network.UseSkill (NOT a BridgeNet2 bridge)
 local StatBridge     = nil   -- ClientBridge("StatUpgrade")
 local Initialized    = false
 
@@ -295,12 +295,24 @@ task.spawn(function()
     table.sort(names)
     print("[QF] Registered bridges:", table.concat(names, ", "))
 
-    -- Now it's safe to create bridges — no more 3s timeout errors
-    QuestBridge    = BridgeNet2.ClientBridge("Quest")
-    UseSkillBridge = BridgeNet2.ReferenceBridge("UseSkill")
-    StatBridge     = BridgeNet2.ClientBridge("StatUpgrade")
+    -- QuestData: BridgeNet2 bridge (confirmed in identifierStorage dump)
+    -- Quest bridge was renamed "Quest" → "QuestData" in a game update
+    QuestBridge = BridgeNet2.ClientBridge("QuestData")
+    StatBridge  = BridgeNet2.ClientBridge("StatUpgrade")
 
-    -- Quest event listener
+    -- UseSkill is a raw RemoteFunction in Network with a literal name, NOT a BridgeNet2 bridge.
+    -- Same pattern as OpenWeapon / WeaponMode in Weapon.lua.
+    -- It may not exist until the weapon system loads, so use WaitForChild.
+    task.spawn(function()
+        UseSkillRemote = ReplicatedStorage.Network:WaitForChild("UseSkill", 60)
+        if UseSkillRemote then
+            print("[QF] UseSkill remote found:", UseSkillRemote.ClassName)
+        else
+            warn("[QF] UseSkill remote not found after 60s — skills disabled")
+        end
+    end)
+
+    -- QuestData event listener (same bridge for NPC quests and board quests)
     -- Server fires: {"QuestReceived", questData}, {"QuestCompleted"}, {"QuestProgress", cur, goal}, etc.
     QuestBridge:Connect(function(data)
         local ev = data[1]
@@ -352,20 +364,25 @@ task.spawn(function()
         if not char or char:GetAttribute("SkillDisabled") then continue end
         if not FindEnemy(CurrentQuest.Target) then continue end
 
+        if not UseSkillRemote then continue end
         local now    = tick()
         local skills = GetLoadedSkillNames()
         for _, name in skills do
             if (SkillCooldowns[name] or 0) > now then continue end
-            local ok, result = pcall(function()
-                return UseSkillBridge:InvokeServerAsync(name)
+            -- Raw RemoteFunction: InvokeServer (blocking). Run in its own thread so
+            -- a slow server response doesn't stall the entire skill loop iteration.
+            task.spawn(function()
+                local ok, result = pcall(function()
+                    return UseSkillRemote:InvokeServer(name)
+                end)
+                if ok and result then
+                    SkillCooldowns[name] = tick() + DEFAULT_SKILL_CD
+                    print("[QF] Skill:", name)
+                else
+                    SkillCooldowns[name] = tick() + 3
+                end
             end)
-            if ok and result then
-                SkillCooldowns[name] = now + DEFAULT_SKILL_CD
-                print("[QF] Skill:", name)
-            elseif not ok then
-                SkillCooldowns[name] = now + 3
-            end
-            task.wait(0.1)
+            task.wait(0.15)
         end
     end
 end)
