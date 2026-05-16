@@ -1,5 +1,5 @@
 -- Kanom Tokyo | Quest Autofarm (Ghoul - Nishiki)
--- Uses level-based NPC quest givers, NOT the rotating board system
+-- Discovers the real Quest bridge name from BridgeNet2 identifierStorage at runtime
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -8,18 +8,12 @@ local LocalPlayer       = Players.LocalPlayer
 local BridgeNet2  = require(ReplicatedStorage.Modules.Library.BridgeNet2)
 local ReplicaCtrl = require(ReplicatedStorage.ReplicaController)
 
-local QuestBridge    = BridgeNet2.ClientBridge("Quest")
-local UseSkillBridge = BridgeNet2.ClientBridge("UseSkill")
-local StatBridge     = BridgeNet2.ClientBridge("StatUpgrade")
-
 -- Config
 local DEFAULT_SKILL_CD = 8
 local UNDER_DEPTH      = 5
 local ATTACK_DIST      = 10
 local StatOrder        = { "Damage", "Durability" }
 
--- Level → NPC quest giver name + quest module path
--- module is at ReplicatedStorage.Modules.Client.TalkNpc.Quests[npcName].Quest
 local QuestTiers = {
     { min = 1,    max = 49,   npc = "QuestGiver (Lv.1-Lv.50)" },
     { min = 50,   max = 149,  npc = "QuestGiver (Lv.50-Lv.150)" },
@@ -40,13 +34,19 @@ local QuestTiers = {
 
 -- Runtime state
 local Running        = true
-local CurrentQuest   = nil   -- {QuestInfo, Goal, Target, Type} from QuestReceived
+local CurrentQuest   = nil
 local QuestDone      = false
 local PlayerLevel    = 1
 local StatPoints     = 0
 local StatIdx        = 1
 local SkillCooldowns = {}
 local Initialized    = false
+
+-- These are resolved inside init — NOT at top level (top-level BridgeNet2.ClientBridge
+-- calls fire immediately and time out after 3s if the server hasn't registered yet)
+local QuestBridge    = nil
+local UseSkillBridge = nil
+local StatBridge     = nil
 
 -- Helpers ----------------------------------------------------------------------
 local function Char() return LocalPlayer.Character end
@@ -78,10 +78,6 @@ local function TPUnderEnemy(hrp)
     r.CFrame = CFrame.new(hrp.Position - Vector3.new(0, UNDER_DEPTH, 0), hrp.Position)
 end
 
--- Rate-limited kagune equip. ToggleWeapon is literally a toggle — calling it twice
--- in rapid succession equips then immediately unequips. isUsingWeapon replicates
--- from the server so there's a delay before the client sees the update.
--- We gate calls to once every 4 seconds so we never accidentally toggle it off.
 local LastEquipAttempt = 0
 local function EquipKagune()
     if LocalPlayer:GetAttribute("isUsingWeapon") then return end
@@ -89,7 +85,6 @@ local function EquipKagune()
     if tick() - LastEquipAttempt < 4 then return end
     LastEquipAttempt = tick()
     _G.ToggleWeapon()
-    -- wait for attribute to replicate before next check
     task.wait(1.5)
 end
 
@@ -104,49 +99,44 @@ local function GetLoadedSkillNames()
     return names
 end
 
--- Find the quest module child for the current player level
 local function GetQuestModuleForLevel(level)
     local questsFolder = ReplicatedStorage.Modules.Client.TalkNpc.Quests
-    for i = #QuestTiers, 1, -1 do   -- iterate highest first so we get the best tier
+    for i = #QuestTiers, 1, -1 do
         local tier = QuestTiers[i]
         if level >= tier.min then
-            local npcModule = questsFolder:FindFirstChild(tier.npc)
-            if npcModule then
-                local questMod = npcModule:FindFirstChild("Quest")
-                if questMod then
-                    return questMod, tier.npc
-                end
+            local npcMod = questsFolder:FindFirstChild(tier.npc)
+            if npcMod then
+                local questMod = npcMod:FindFirstChild("Quest")
+                if questMod then return questMod, tier.npc end
             end
         end
     end
     return nil, nil
 end
 
--- Teleport near the NPC quest giver before accepting (server may check proximity)
 local function TPNearNPC(npcName)
-    local giverFolder = workspace:FindFirstChild("TalkNpc")
-    if not giverFolder then return end
-    local giverParent = giverFolder:FindFirstChild("QuestGiver")
-    if not giverParent then return end
-    local npc = giverParent:FindFirstChild(npcName)
+    local talknpc = workspace:FindFirstChild("TalkNpc")
+    if not talknpc then return end
+    local givers = talknpc:FindFirstChild("QuestGiver")
+    if not givers then return end
+    local npc = givers:FindFirstChild(npcName)
     if not npc then return end
     local hrp = npc:FindFirstChild("HumanoidRootPart") or npc.PrimaryPart
     if not hrp then return end
     local r = Root()
-    if r then
-        r.CFrame = CFrame.new(hrp.Position + Vector3.new(3, 0, 3))
-    end
+    if r then r.CFrame = CFrame.new(hrp.Position + Vector3.new(3, 0, 3)) end
 end
 
 local function AcceptQuest()
+    if not QuestBridge then print("[QF] Quest bridge not ready yet") return end
     local questMod, npcName = GetQuestModuleForLevel(PlayerLevel)
     if questMod then
-        print("[QF] Accepting quest from:", npcName)
+        print("[QF] Accepting:", npcName)
         TPNearNPC(npcName)
         task.wait(0.3)
         QuestBridge:Fire({ "RequestQuest", questMod })
     else
-        print("[QF] No quest module found for level", PlayerLevel)
+        print("[QF] No quest module for level", PlayerLevel)
     end
 end
 
@@ -157,55 +147,104 @@ ReplicaCtrl.ReplicaOfClassCreated("DataToken_" .. LocalPlayer.UserId, function(r
     if not data then return end
     PlayerLevel = data.Level or 1
     StatPoints  = data.StatPoint or 0
-    replica:ListenToChange({ "Level" }, function(v)
-        PlayerLevel = v
-        -- If we crossed a tier boundary mid-quest, abandon and re-accept
-        -- (handled automatically: AcceptQuest uses current PlayerLevel)
-    end)
-    replica:ListenToChange({ "StatPoint" }, function(v)
-        StatPoints = v
-    end)
+    replica:ListenToChange({ "Level" }, function(v) PlayerLevel = v end)
+    replica:ListenToChange({ "StatPoint" }, function(v) StatPoints = v end)
 end)
 
--- Quest event bridge
-QuestBridge:Connect(function(data)
-    local ev = data[1]
-    if ev == "QuestReceived" then
-        CurrentQuest = data[2]
-        QuestDone    = false
-        if CurrentQuest then
-            print("[QF] Quest:", CurrentQuest.QuestInfo, "| Goal:", CurrentQuest.Goal)
-        end
-    elseif ev == "QuestCompleted" then
-        print("[QF] Complete! Re-accepting immediately...")
-        QuestDone    = true
-        CurrentQuest = nil
-    elseif ev == "QuestRemoved" then
-        CurrentQuest = nil
-        QuestDone    = false
-    elseif ev == "QuestProgress" then
-        print("[QF] Progress:", data[2], "/", data[3])
-    end
-end)
-
--- Re-equip on respawn.
--- Weapon.lua sets an internal 3-second toggle cooldown (u19) on CharacterAdded,
--- so we must wait >3s before ToggleWeapon will do anything. We also reset
--- LastEquipAttempt so the rate-limiter doesn't block the first attempt.
+-- Re-equip on respawn
 LocalPlayer.CharacterAdded:Connect(function()
-    task.wait(4)  -- outlast Weapon.lua's 3s u19 cooldown
+    task.wait(4)
     repeat task.wait(0.2) until LocalPlayer:GetAttribute("Loaded")
-    LastEquipAttempt = 0  -- reset rate-limiter so we try immediately
+    LastEquipAttempt = 0
     EquipKagune()
     print("[QF] Respawned — kagune equip attempted")
 end)
 
--- Init gate
+-- Init: resolve all bridges AFTER player is loaded ----------------------------
 task.spawn(function()
     repeat task.wait(0.5) until LocalPlayer:GetAttribute("Loaded") and LocalPlayer:GetAttribute("Team")
+
+    -- Give the server a moment to register all bridges into identifierStorage
+    task.wait(2)
+
+    -- Read BridgeNet2 identifierStorage to find real bridge names
+    local bn2Module = ReplicatedStorage.Modules.Library.BridgeNet2
+    local idStore   = bn2Module:FindFirstChild("identifierStorage")
+
+    local allBridges = {}
+    if idStore then
+        for name, _ in idStore:GetAttributes() do
+            table.insert(allBridges, name)
+            -- Print every bridge so we can debug if needed
+        end
+        table.sort(allBridges)
+        print("[QF] Registered bridges:", table.concat(allBridges, ", "))
+    else
+        -- identifierStorage might live deeper — wait for it
+        idStore = bn2Module:WaitForChild("identifierStorage", 10)
+        if idStore then
+            for name, _ in idStore:GetAttributes() do
+                table.insert(allBridges, name)
+            end
+            print("[QF] Registered bridges:", table.concat(allBridges, ", "))
+        else
+            warn("[QF] identifierStorage not found — can't auto-detect bridge names")
+        end
+    end
+
+    -- Find the quest bridge: look for "quest" (case-insensitive) in registered names
+    local questBridgeName, useSkillBridgeName, statBridgeName
+    for _, name in allBridges do
+        local lower = name:lower()
+        if lower == "quest" or lower:find("^quest$") then
+            questBridgeName = name
+        elseif lower:find("quest") and not lower:find("data") then
+            -- fallback: any quest-related bridge that isn't QuestData (the board)
+            questBridgeName = questBridgeName or name
+        end
+        if lower:find("skill") or lower:find("useskill") then
+            useSkillBridgeName = name
+        end
+        if lower:find("statupgrade") or lower:find("stat") then
+            statBridgeName = name
+        end
+    end
+
+    -- Fallback names in case auto-detection misses
+    questBridgeName    = questBridgeName    or "Quest"
+    useSkillBridgeName = useSkillBridgeName or "UseSkill"
+    statBridgeName     = statBridgeName     or "StatUpgrade"
+
+    print("[QF] Using bridges — Quest:", questBridgeName, "| Skill:", useSkillBridgeName, "| Stat:", statBridgeName)
+
+    QuestBridge    = BridgeNet2.ClientBridge(questBridgeName)
+    UseSkillBridge = BridgeNet2.ClientBridge(useSkillBridgeName)
+    StatBridge     = BridgeNet2.ClientBridge(statBridgeName)
+
+    -- Hook quest events
+    QuestBridge:Connect(function(data)
+        local ev = data[1]
+        if ev == "QuestReceived" then
+            CurrentQuest = data[2]
+            QuestDone    = false
+            if CurrentQuest then
+                print("[QF] Quest:", CurrentQuest.QuestInfo, "| Goal:", CurrentQuest.Goal)
+            end
+        elseif ev == "QuestCompleted" then
+            print("[QF] Complete!")
+            QuestDone    = true
+            CurrentQuest = nil
+        elseif ev == "QuestRemoved" then
+            CurrentQuest = nil
+            QuestDone    = false
+        elseif ev == "QuestProgress" then
+            print("[QF] Progress:", data[2], "/", data[3])
+        end
+    end)
+
+    Initialized = true
     print("[QF] Ready | Level:", PlayerLevel, "| Team:", LocalPlayer:GetAttribute("Team"))
     EquipKagune()
-    Initialized = true
 end)
 
 -- Stat allocation --------------------------------------------------------------
@@ -213,9 +252,8 @@ task.spawn(function()
     repeat task.wait(0.5) until Initialized
     while Running do
         task.wait(0.8)
-        while StatPoints > 0 do
-            local stat = StatOrder[StatIdx]
-            StatBridge:Fire({ { stat, 1 } })
+        while StatPoints > 0 and StatBridge do
+            StatBridge:Fire({ { StatOrder[StatIdx], 1 } })
             StatIdx    = (StatIdx % #StatOrder) + 1
             StatPoints -= 1
             task.wait(0.3)
@@ -228,7 +266,7 @@ task.spawn(function()
     repeat task.wait(0.5) until Initialized
     while Running do
         task.wait(0.2)
-        if not CurrentQuest then continue end
+        if not CurrentQuest or not UseSkillBridge then continue end
         if not LocalPlayer:GetAttribute("isUsingWeapon") then continue end
         local char = Char()
         if not char or char:GetAttribute("SkillDisabled") then continue end
@@ -258,21 +296,18 @@ task.spawn(function()
         local char = Char()
         if not char or not Root() then task.wait(1) continue end
 
-        -- Accept / re-accept quest
         if not CurrentQuest then
             AcceptQuest()
             task.wait(1.5)
             continue
         end
 
-        -- Brief rest after complete then instantly re-accept same tier
         if QuestDone then
             task.wait(1)
             QuestDone = false
             continue
         end
 
-        -- Attack enemies
         if CurrentQuest.Target then
             EquipKagune()
             local enemy = FindEnemy(CurrentQuest.Target)
