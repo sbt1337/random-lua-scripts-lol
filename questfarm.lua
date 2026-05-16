@@ -1,7 +1,7 @@
 -- Kanom Tokyo | Quest Autofarm (Ghoul - Nishiki)
 -- * Auto-accepts best level-appropriate quest from the board
 -- * Attacks from 5 studs underground, facing up at enemy (hitbox offset hits through floor)
--- * Auto-fires Tail Whip skill with local cooldown guard
+-- * Auto-discovers and fires all Nishiki skills as they get unlocked (no hardcoding needed)
 -- * Alternates Damage / Durability stat allocation when points are available
 -- * Re-equips kagune on respawn and whenever it drops mid-fight
 
@@ -16,11 +16,10 @@ local BridgeNet2        = require(ReplicatedStorage.Modules.Library.BridgeNet2)
 local ReplicaCtrl       = require(ReplicatedStorage.ReplicaController)
 
 -- Config
-local SKILL_NAME  = "Tail Whip"
-local SKILL_CD    = 8       -- seconds; server rejects early if still on CD, safe to retry
-local BOARD_POS   = Vector3.new(-240, 34, 208)
-local UNDER_DEPTH = 5       -- studs below enemy HRP
-local ATTACK_DIST = 10      -- re-TP if farther than this
+local DEFAULT_SKILL_CD = 8   -- fallback cooldown estimate (seconds) per skill
+local BOARD_POS        = Vector3.new(-240, 34, 208)
+local UNDER_DEPTH      = 5   -- studs below enemy HRP
+local ATTACK_DIST      = 10  -- re-TP threshold
 
 -- Stat alternation: Damage first, then Durability, repeat
 local StatOrder = { "Damage", "Durability" }
@@ -35,7 +34,8 @@ local QuestDone         = false
 local ShouldRepick      = false
 local PlayerLevel       = 1
 local StatPoints        = 0
-local TailWhipEnd       = 0
+-- Per-skill cooldown end times, keyed by skill name
+local SkillCooldowns = {}
 
 local StatBridge = BridgeNet2.ClientBridge("StatUpgrade")
 
@@ -191,15 +191,32 @@ task.spawn(function()
     end
 end)
 
--- Skill thread -----------------------------------------------------------------
+-- Auto-discover skills from ReplicatedStorage.Inputs.Skills.
+-- SkillClientHandler registers each skill's InputAction there when the weapon is
+-- loaded, so this naturally includes only the ones currently in the weapon module.
+-- New skills appear here as soon as they unlock — no script changes needed.
+local function GetLoadedSkillNames()
+    local names   = {}
+    local folder  = ReplicatedStorage:FindFirstChild("Inputs")
+    folder        = folder and folder:FindFirstChild("Skills")
+    if not folder then return names end
+    for _, action in folder:GetChildren() do
+        -- InputAction instances are the registered skills
+        if action.ClassName == "InputAction" or action:IsA("Instance") then
+            table.insert(names, action.Name)
+        end
+    end
+    return names
+end
+
+-- Skill thread: cycles through all currently-loaded skills, fires any off cooldown
 task.spawn(function()
     repeat task.wait(0.5) until LocalPlayer:GetAttribute("Loaded")
     while Running do
-        task.wait(0.15)
+        task.wait(0.2)
 
         if not CurrentQuest then continue end
         if not LocalPlayer:GetAttribute("isUsingWeapon") then continue end
-        if tick() < TailWhipEnd then continue end
 
         local char = Char()
         if not char or char:GetAttribute("SkillDisabled") then continue end
@@ -207,14 +224,23 @@ task.spawn(function()
         local enemy = FindEnemy(CurrentQuest.Target)
         if not enemy then continue end
 
-        local ok, result = pcall(function()
-            return UseSkillRemote:InvokeServer(SKILL_NAME)
-        end)
-        if ok and result then
-            TailWhipEnd = tick() + SKILL_CD
-            print("[QF] Tail Whip")
-        elseif not ok then
-            TailWhipEnd = tick() + 2   -- small backoff on error
+        local now    = tick()
+        local skills = GetLoadedSkillNames()
+
+        for _, name in skills do
+            if (SkillCooldowns[name] or 0) > now then continue end
+
+            local ok, result = pcall(function()
+                return UseSkillRemote:InvokeServer(name)
+            end)
+            if ok and result then
+                SkillCooldowns[name] = now + DEFAULT_SKILL_CD
+                print("[QF] Skill fired:", name)
+            elseif not ok then
+                SkillCooldowns[name] = now + 2   -- brief backoff on pcall error
+            end
+            -- small gap between firing multiple skills back-to-back
+            task.wait(0.1)
         end
     end
 end)
