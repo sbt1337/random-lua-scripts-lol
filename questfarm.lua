@@ -83,16 +83,25 @@ local function TPUnderEnemy(hrp)
     r.CFrame = CFrame.new(hrp.Position - Vector3.new(0, UNDER_DEPTH, 0), hrp.Position)
 end
 
--- Equip kagune by directly invoking the weapon remote (sniffed from live traffic).
--- GUID {92B28BAD-1E62-4CAF-A884-F0FF1110DE20} = OpenWeapon RemoteFunction in Network.
--- Calling InvokeServer("Nishiki") is exactly what the game does on manual equip.
--- No flip-flop race condition, no dependency on _G.ToggleWeapon internal state.
--- Still rate-limited to 4s: Weapon.lua sets a 3s server-side cooldown on CharacterAdded.
+-- Kagune equip: replicate all 3 remotes captured from live traffic.
+--   1) Raw RF  {92B28BAD-...}:InvokeServer("Nishiki")
+--   2) BridgeNet2 dataRemoteEvent fire — gamepass ownership payload {1584312663}
+--   3) BridgeNet2 dataRemoteEvent fire — weapon-activated signal (no payload)
+-- Without all three the weapon doesn't fully load server-side.
 local WeaponRemoteGUID = "{92B28BAD-1E62-4CAF-A884-F0FF1110DE20}"
 local WeaponName       = "Nishiki"
 local LastEquipAt      = 0
 
-local WeaponRemote = nil  -- resolved once on init
+-- BridgeNet2 raw transport — all bridge traffic goes through this RemoteEvent
+local BN2DataRemote = nil
+local function GetBN2DataRemote()
+    if BN2DataRemote and BN2DataRemote.Parent then return BN2DataRemote end
+    local bn2 = ReplicatedStorage:FindFirstChild("BridgeNet2")
+    BN2DataRemote = bn2 and bn2:FindFirstChild("dataRemoteEvent")
+    return BN2DataRemote
+end
+
+local WeaponRemote = nil
 local function GetWeaponRemote()
     if WeaponRemote and WeaponRemote.Parent then return WeaponRemote end
     WeaponRemote = ReplicatedStorage.Network:FindFirstChild(WeaponRemoteGUID)
@@ -108,9 +117,32 @@ local function EquipKagune()
         return
     end
     LastEquipAt = tick()
-    local ok, err = pcall(function() remote:InvokeServer(WeaponName) end)
-    if not ok then warn("[QF] EquipKagune error:", err) end
+
+    -- Remote 1: weapon equip RF
+    pcall(function() remote:InvokeServer(WeaponName) end)
+    task.wait(0.05)
+
+    local bn2 = GetBN2DataRemote()
+    if bn2 then
+        -- Remote 2: gamepass ownership data ({1584312663} = x2 Mastery gamepass)
+        pcall(function()
+            bn2:FireServer({
+                {"\001", "\178\187\175\023\223HB\001\164\005\147Sl\221\242\229", {1584312663}},
+                "\002"
+            })
+        end)
+        task.wait(0.05)
+        -- Remote 3: weapon-activated signal
+        pcall(function()
+            bn2:FireServer({
+                {"\001", "\219\171LD\170\184B_\1622:\246\193\231\155\213"},
+                "\006"
+            })
+        end)
+    end
+
     task.wait(1.5)
+    print("[QF] EquipKagune fired — isUsingWeapon:", LocalPlayer:GetAttribute("isUsingWeapon"))
 end
 
 local function GetLoadedSkillNames()
@@ -140,43 +172,97 @@ local function GetQuestModule()
     return nil, nil
 end
 
-local function TPNearNPC(npcName)
+local function FindNPCInWorkspace(npcName)
+    -- QuestGiver NPCs live in workspace.TalkNpc.QuestGiver.<name>
     local talknpc = workspace:FindFirstChild("TalkNpc")
-    if not talknpc then return end
+    if not talknpc then return nil end
     local givers = talknpc:FindFirstChild("QuestGiver")
-    if not givers then return end
-    local npc = givers:FindFirstChild(npcName)
-    if not npc then return end
-    local hrp = npc:FindFirstChild("HumanoidRootPart") or npc.PrimaryPart
-    if not hrp then return end
-    local r = Root()
-    if r then r.CFrame = CFrame.new(hrp.Position + Vector3.new(3, 0, 3)) end
+    if not givers then return nil end
+    return givers:FindFirstChild(npcName)
 end
 
 local function AcceptQuest()
-    if not QuestBridge then return end
-    local questMod, npcName = GetQuestModule()
-    if not questMod then
-        print("[QF] No quest module for level", PlayerLevel)
+    local _, npcName = GetQuestModule()
+    if not npcName then
+        print("[QF] No quest tier for level", PlayerLevel)
         return
     end
-    print("[QF] Accepting:", npcName)
-    TPNearNPC(npcName)
+
+    local npc = FindNPCInWorkspace(npcName)
+    if not npc then
+        print("[QF] NPC not in workspace:", npcName)
+        return
+    end
+
+    local hrp = npc:FindFirstChild("HumanoidRootPart") or npc.PrimaryPart
+    if not hrp then return end
+
+    -- TP within interaction range (NpcDialogue closes if > 20 studs away)
+    local r = Root()
+    if r then r.CFrame = CFrame.new(hrp.Position + Vector3.new(3, 0, 0)) end
+    task.wait(0.3)
+
+    -- Fire the ProximityPrompt the NpcDialogue system attached to the NPC
+    local prompt = hrp:FindFirstChildOfClass("ProximityPrompt")
+    if not prompt then
+        for _, d in npc:GetDescendants() do
+            if d:IsA("ProximityPrompt") then prompt = d break end
+        end
+    end
+    if not prompt then
+        print("[QF] No ProximityPrompt on", npcName)
+        return
+    end
+
+    print("[QF] Triggering dialogue:", npcName)
+    fireproximityprompt(prompt)
+
+    -- Wait for the NpcDialogue GUI to appear in PlayerGui
+    local gui = LocalPlayer.PlayerGui:WaitForChild("NpcDialogue", 4)
+    if not gui then
+        print("[QF] Dialogue GUI didn't open")
+        return
+    end
+    task.wait(0.8)  -- let typewriter animation finish and buttons appear
+
+    -- Click the first "Choice" button (the "Understood." answer)
+    -- NpcDialogue.lua names each answer button "Choice" under Container.AnswerList
+    local answerList = gui:FindFirstChild("Container") and gui.Container:FindFirstChild("AnswerList")
+    if answerList then
+        for _, btn in answerList:GetChildren() do
+            if btn.Name == "Choice" then
+                print("[QF] Clicking:", btn:FindFirstChild("AnswerText") and btn.AnswerText.Text or "?")
+                btn.MouseButton1Click:Fire()
+                break
+            end
+        end
+    else
+        print("[QF] AnswerList not found in dialogue")
+    end
     task.wait(0.5)
-    -- BridgeNet2 Fire mirrors what TalkNpc does: FireServer("RequestQuest", script.Quest)
-    QuestBridge:Fire({ "RequestQuest", questMod })
 end
 
 -- Collectible system -----------------------------------------------------------
--- Watch workspace for ProximityPrompts outside AI/TalkNpc folders.
--- These are map collectibles (resource nodes, flowers, crystals, etc.)
-local IgnoredFolders = { ["AI"] = true, ["TalkNpc"] = true, ["IncludeToGame"] = true }
+-- Watch workspace for ProximityPrompts that are map pickups.
+-- Must walk the FULL ancestor chain — FindFirstAncestorWhichIsA("Folder") only
+-- returns the nearest folder, which for NPC prompts is "QuestGiver" not "TalkNpc",
+-- causing them to slip through the filter.
+local IgnoredAncestors = { ["TalkNpc"] = true, ["IncludeToGame"] = true }
 
 local function IsCollectible(prompt)
-    -- Only care about prompts NOT parented inside ignored folders
-    local anc = prompt:FindFirstAncestorWhichIsA("Folder") or prompt:FindFirstAncestorWhichIsA("Model")
-    if anc and IgnoredFolders[anc.Name] then return false end
-    -- Workspace-level models or Map children with prompts = collectible
+    -- Reject anything inside a player's character
+    local plrs = game:GetService("Players")
+    for _, plr in plrs:GetPlayers() do
+        if plr.Character and prompt:IsDescendantOf(plr.Character) then return false end
+    end
+    -- Walk every ancestor up to workspace and reject if any ignored name matches
+    local cur = prompt.Parent
+    while cur and cur ~= workspace do
+        if IgnoredAncestors[cur.Name] then return false end
+        -- Also reject AI/Player folder (literal slash in name)
+        if cur.Name == "AI/Player" or cur.Name == "AI" then return false end
+        cur = cur.Parent
+    end
     return true
 end
 
@@ -329,9 +415,9 @@ task.spawn(function()
         end
     end)
 
-    -- QuestData event listener (same bridge for NPC quests and board quests)
-    -- Server fires: {"QuestReceived", questData}, {"QuestCompleted"}, {"QuestProgress", cur, goal}, etc.
+    -- QuestData event listener — print every raw event so we can verify event names
     QuestBridge:Connect(function(data)
+        print("[QF] QuestData event:", data[1], "| data[2] type:", type(data[2]))
         local ev = data[1]
         if ev == "QuestReceived" then
             CurrentQuest = data[2]
