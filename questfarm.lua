@@ -9,11 +9,16 @@ local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local LocalPlayer       = Players.LocalPlayer
-local QuestNet          = ReplicatedStorage.Network.Quest
-local UseSkillRemote    = ReplicatedStorage.Network.UseSkill
-local QuestBoardDB      = ReplicatedStorage.Modules.DataBase.QuestBoard
-local BridgeNet2        = require(ReplicatedStorage.Modules.Library.BridgeNet2)
-local ReplicaCtrl       = require(ReplicatedStorage.ReplicaController)
+
+-- WaitForChild on everything in Network — the folder is runtime-created by the server
+-- and may not be populated yet when an injected script runs
+local Network        = ReplicatedStorage:WaitForChild("Network")
+local QuestNet       = Network:WaitForChild("Quest")
+local UseSkillRemote = Network:WaitForChild("UseSkill")
+
+local QuestBoardDB  = ReplicatedStorage:WaitForChild("Modules"):WaitForChild("DataBase"):WaitForChild("QuestBoard")
+local BridgeNet2    = require(ReplicatedStorage.Modules.Library.BridgeNet2)
+local ReplicaCtrl   = require(ReplicatedStorage.ReplicaController)
 
 -- Config
 local DEFAULT_SKILL_CD = 8   -- fallback cooldown estimate (seconds) per skill
