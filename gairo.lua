@@ -218,6 +218,33 @@ local function GetGairo()
     return Zombies:FindFirstChild("Sorcerer")
 end
 
+-- True while the boss is in a ForceField / invincibility phase.
+-- Covers both Roblox ForceField instances and common game attribute flags.
+local function GairoIsShielded(Gairo)
+    if not Gairo then return false end
+    -- Instance-based ForceField (most common pattern)
+    for _, d in Gairo:GetDescendants() do
+        if d:IsA("ForceField") then return true end
+    end
+    -- Attribute-based invincibility flags
+    local InvincAttrs = { "Invincible", "Shielded", "ForceField", "Immune", "Untargetable" }
+    for _, attr in ipairs(InvincAttrs) do
+        local v = Gairo:GetAttribute(attr)
+        if v == true or v == 1 then return true end
+    end
+    -- Config value approach (some games put an Invincible BoolValue under Config)
+    local Config = Gairo:FindFirstChild("Config")
+    if Config then
+        for _, attr in ipairs(InvincAttrs) do
+            local val = Config:FindFirstChild(attr)
+            if val and (val:IsA("BoolValue") or val:IsA("IntValue")) and val.Value ~= false and val.Value ~= 0 then
+                return true
+            end
+        end
+    end
+    return false
+end
+
 -- Locate the left-leg part. Returns (Part, UseFallback). UseFallback=true means we
 -- only found HRP and the caller should offset us downward toward floor level.
 local function GetGairoLeg(Gairo)
@@ -331,6 +358,9 @@ task.spawn(function()
             HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
 
             if IsActionBlocked() then return end
+
+            -- Skip ability spam while boss is shielded / invulnerable
+            if GairoIsShielded(Gairo) then return end
 
             local Interact = GetInteract()
             if not Interact then return end
