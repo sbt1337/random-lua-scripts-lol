@@ -8,11 +8,13 @@ local LocalPlayer       = Players.LocalPlayer
 local BridgeNet2  = require(ReplicatedStorage.Modules.Library.BridgeNet2)
 local ReplicaCtrl = require(ReplicatedStorage.ReplicaController)
 
--- BridgeNet2 bridges (resolved immediately — just a GUID lookup, no yielding)
-local QuestBridge    = BridgeNet2.ClientBridge("Quest")
-local UseSkillBridge = BridgeNet2.ClientBridge("UseSkill")
-local StatBridge     = BridgeNet2.ClientBridge("StatUpgrade")
+-- Only connect bridges we KNOW exist on the server
+-- Quest and UseSkill bridges will be found via debug dump
+local StatBridge      = BridgeNet2.ClientBridge("StatUpgrade")
 local QuestDataBridge = BridgeNet2.ClientBridge("QuestData")
+-- placeholders filled after debug confirms real names
+local QuestBridge    = nil
+local UseSkillBridge = nil
 
 -- Config
 local DEFAULT_SKILL_CD = 8
@@ -142,7 +144,8 @@ QuestDataBridge:Connect(function(payload)
 end)
 
 -- Quest event bridge: server sends {eventType, ...args}
-QuestBridge:Connect(function(data)
+-- (QuestBridge is nil until we know the real bridge name — guarded below)
+if QuestBridge then QuestBridge:Connect(function(data)
     local ev = data[1]
     if ev == "QuestReceived" then
         CurrentQuest = data[2]
@@ -161,7 +164,7 @@ QuestBridge:Connect(function(data)
     elseif ev == "QuestProgress" then
         print("[QF] Progress:", data[2], "/", data[3])
     end
-end)
+end) end
 
 -- Re-equip on respawn
 LocalPlayer.CharacterAdded:Connect(function()
@@ -169,6 +172,41 @@ LocalPlayer.CharacterAdded:Connect(function()
     repeat task.wait(0.2) until LocalPlayer:GetAttribute("Loaded")
     EquipKagune()
     print("[QF] Respawned — kagune equipped")
+end)
+
+-- DEBUG: dump every registered BridgeNet2 bridge name + scan Network recursively
+task.spawn(function()
+    repeat task.wait(0.5) until LocalPlayer:GetAttribute("Loaded")
+    task.wait(2) -- let identifierStorage populate
+
+    -- BridgeNet2 identifier storage (name → GUID map)
+    local bn2 = ReplicatedStorage.Modules.Library.BridgeNet2
+    local idStore = bn2:FindFirstChild("identifierStorage")
+    if idStore then
+        print("[QF-DEBUG] BridgeNet2 registered bridges:")
+        for name, guid in idStore:GetAttributes() do
+            print("  BRIDGE:", name, "→", guid)
+        end
+    else
+        print("[QF-DEBUG] identifierStorage not found in BridgeNet2 module")
+    end
+
+    -- Full recursive scan of Network folder
+    local function scanFolder(folder, indent)
+        for _, child in folder:GetChildren() do
+            print(indent .. child.Name .. " [" .. child.ClassName .. "]")
+            if child:IsA("Folder") then
+                scanFolder(child, indent .. "  ")
+            end
+        end
+    end
+    local Network = ReplicatedStorage:FindFirstChild("Network")
+    if Network then
+        print("[QF-DEBUG] ReplicatedStorage.Network full tree:")
+        scanFolder(Network, "  ")
+    else
+        print("[QF-DEBUG] Network folder not found!")
+    end
 end)
 
 -- Init gate: wait for player loaded, then unlock all loops ---------------------
