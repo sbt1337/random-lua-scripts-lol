@@ -163,6 +163,16 @@ task.spawn(function()
     end
     print("[QF] Network folder found. Waiting for remotes...")
 
+    -- Dump every child of Network so we can see the real names
+    print("[QF] Network children:")
+    for _, child in Network:GetChildren() do
+        print("  >>", child.Name, "|", child.ClassName)
+    end
+    -- Also watch for anything added later
+    Network.ChildAdded:Connect(function(child)
+        print("[QF] Network.ChildAdded:", child.Name, "|", child.ClassName)
+    end)
+
     -- poll for each remote individually so we can report which one is missing
     local deadline = tick() + 30
     repeat task.wait(0.5)
@@ -172,6 +182,10 @@ task.spawn(function()
 
     if not QuestNet then
         warn("[QF] Quest remote not found after 30s — aborting")
+        warn("[QF] Network children at timeout:")
+        for _, child in Network:GetChildren() do
+            warn("  >>", child.Name, "|", child.ClassName)
+        end
         return
     end
     if not UseSkillRemote then
