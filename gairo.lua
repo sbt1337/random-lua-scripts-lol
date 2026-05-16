@@ -28,8 +28,9 @@ do
 end
 
 -- Config
-local WEBHOOK = "https://discord.com/api/webhooks/1503857688118034662/H3y9e9EUyyZyRnKCQ-X_eIdRpejU8OwStg22dzEoycfGt__iAhRTYmnumIenbFWEckS7"
+local WEBHOOK     = "https://discord.com/api/webhooks/1503857688118034662/H3y9e9EUyyZyRnKCQ-X_eIdRpejU8OwStg22dzEoycfGt__iAhRTYmnumIenbFWEckS7"
 local LOG_WEBHOOK = "https://discord.com/api/webhooks/1504232139749720074/D_Oe_5gwVDguw2eUeqZbKvpmxBLeajcEZxClzS4tvyAyS80zlL3iOLHsrpOTXUsh_gdu"
+local RAW_URL     = "https://raw.githubusercontent.com/sbt1337/random-lua-scripts-lol/refs/heads/main/gairo.lua"
 
 local TP_INTERVAL        = 0.05   -- how often we re-stick to the leg (handles boss movement)
 local LEG_Y_OFFSET       = 0      -- vertical offset from leg part center; tune up/down if abilities miss
@@ -638,6 +639,44 @@ LocalPlayer.CharacterAdded:Connect(SetupCharacter)
 if Character and Character.Parent then
     task.spawn(SetupCharacter, Character)
 end
+
+-- Reload GUI
+local function MakeReloadButton()
+    local old = LocalPlayer.PlayerGui:FindFirstChild("GairoFarmGUI")
+    if old then old:Destroy() end
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name           = "GairoFarmGUI"
+    sg.ResetOnSpawn   = false
+    sg.IgnoreGuiInset = true
+    sg.Parent         = LocalPlayer.PlayerGui
+
+    local btn = Instance.new("TextButton")
+    btn.Size             = UDim2.new(0, 150, 0, 38)
+    btn.Position         = UDim2.new(0.5, -75, 0.5, -19)
+    btn.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+    btn.TextColor3       = Color3.fromRGB(255, 75, 75)
+    btn.Font             = Enum.Font.GothamBold
+    btn.TextSize         = 14
+    btn.Text             = "⟳  RELOAD FARM"
+    btn.BorderSizePixel  = 0
+    btn.Parent           = sg
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
+
+    local stroke = Instance.new("UIStroke", btn)
+    stroke.Color     = Color3.fromRGB(255, 75, 75)
+    stroke.Thickness = 1.2
+
+    btn.MouseButton1Click:Connect(function()
+        Running = false
+        print("[GairoFarm] Reloading...")
+        sg:Destroy()
+        task.wait(0.3)
+        loadstring(game:HttpGet(RAW_URL))()
+    end)
+end
+
+MakeReloadButton()
 
 -- Boot ping
 task.spawn(function()
