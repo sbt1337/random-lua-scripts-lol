@@ -1,5 +1,5 @@
 -- Kanom Tokyo | Quest Autofarm (Ghoul - Nishiki)
--- All networking via BridgeNet2 (Network folder is GUID-named, no plain "Quest" child)
+-- Uses level-based NPC quest givers, NOT the rotating board system
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -8,33 +8,45 @@ local LocalPlayer       = Players.LocalPlayer
 local BridgeNet2  = require(ReplicatedStorage.Modules.Library.BridgeNet2)
 local ReplicaCtrl = require(ReplicatedStorage.ReplicaController)
 
--- Only connect bridges we KNOW exist on the server
--- Quest and UseSkill bridges will be found via debug dump
-local StatBridge      = BridgeNet2.ClientBridge("StatUpgrade")
-local QuestDataBridge = BridgeNet2.ClientBridge("QuestData")
--- placeholders filled after debug confirms real names
-local QuestBridge    = nil
-local UseSkillBridge = nil
+local QuestBridge    = BridgeNet2.ClientBridge("Quest")
+local UseSkillBridge = BridgeNet2.ClientBridge("UseSkill")
+local StatBridge     = BridgeNet2.ClientBridge("StatUpgrade")
 
 -- Config
 local DEFAULT_SKILL_CD = 8
-local BOARD_POS        = Vector3.new(-240, 34, 208)
 local UNDER_DEPTH      = 5
 local ATTACK_DIST      = 10
 local StatOrder        = { "Damage", "Durability" }
 
+-- Level → NPC quest giver name + quest module path
+-- module is at ReplicatedStorage.Modules.Client.TalkNpc.Quests[npcName].Quest
+local QuestTiers = {
+    { min = 1,    max = 49,   npc = "QuestGiver (Lv.1-Lv.50)" },
+    { min = 50,   max = 149,  npc = "QuestGiver (Lv.50-Lv.150)" },
+    { min = 150,  max = 249,  npc = "QuestGiver (Lv.150-Lv.250)" },
+    { min = 250,  max = 349,  npc = "QuestGiver (Lv.250-Lv.350)" },
+    { min = 350,  max = 399,  npc = "QuestGiver (Lv.350-Lv.400)" },
+    { min = 400,  max = 449,  npc = "QuestGiver (Lv.400-Lv.450)" },
+    { min = 450,  max = 499,  npc = "QuestGiver (Lv.450-Lv.500)" },
+    { min = 500,  max = 549,  npc = "QuestGiver (Lv.500-Lv.550)" },
+    { min = 550,  max = 599,  npc = "QuestGiver (Lv.550-Lv.600)" },
+    { min = 600,  max = 699,  npc = "QuestGiver (Lv.600-Lv.700)" },
+    { min = 700,  max = 799,  npc = "QuestGiver (Lv.700-Lv.800)" },
+    { min = 800,  max = 899,  npc = "QuestGiver (Lv.800-Lv.900)" },
+    { min = 900,  max = 999,  npc = "QuestGiver (Lv.900-Lv.1000)" },
+    { min = 1000, max = 1099, npc = "QuestGiver (Lv.1000-Lv.1100)" },
+    { min = 1100, max = math.huge, npc = "QuestGiver (Lv.1100-Lv.1200)" },
+}
+
 -- Runtime state
-local Running         = true
-local AvailableQuests = {}
-local CompletedUIDs   = {}
-local CurrentQuest    = nil
-local QuestDone       = false
-local ShouldRepick    = false
-local PlayerLevel     = 1
-local StatPoints      = 0
-local StatIdx         = 1
-local SkillCooldowns  = {}
-local Initialized     = false
+local Running        = true
+local CurrentQuest   = nil   -- {QuestInfo, Goal, Target, Type} from QuestReceived
+local QuestDone      = false
+local PlayerLevel    = 1
+local StatPoints     = 0
+local StatIdx        = 1
+local SkillCooldowns = {}
+local Initialized    = false
 
 -- Helpers ----------------------------------------------------------------------
 local function Char() return LocalPlayer.Character end
@@ -84,39 +96,53 @@ local function GetLoadedSkillNames()
     return names
 end
 
-local function BestQuest()
-    if #AvailableQuests == 0 then return nil end
-    local QuestBoardDB = ReplicatedStorage.Modules.DataBase.QuestBoard
-    local best, bestLv = nil, -1
-    for _, q in AvailableQuests do
-        if CompletedUIDs[q.UID] then continue end
-        local mod = QuestBoardDB:FindFirstChild(q.QuestName, true)
-        if not mod then continue end
-        local ok, data = pcall(require, mod)
-        if not ok then continue end
-        local targets = data.Target or {}
-        if table.find(targets, "Player") then continue end
-        local lv = data.LevelRequired or 0
-        if lv <= PlayerLevel and lv > bestLv then
-            bestLv = lv
-            best = { q = q, mod = mod, info = data.QuestInfo }
+-- Find the quest module child for the current player level
+local function GetQuestModuleForLevel(level)
+    local questsFolder = ReplicatedStorage.Modules.Client.TalkNpc.Quests
+    for i = #QuestTiers, 1, -1 do   -- iterate highest first so we get the best tier
+        local tier = QuestTiers[i]
+        if level >= tier.min then
+            local npcModule = questsFolder:FindFirstChild(tier.npc)
+            if npcModule then
+                local questMod = npcModule:FindFirstChild("Quest")
+                if questMod then
+                    return questMod, tier.npc
+                end
+            end
         end
     end
-    return best
+    return nil, nil
 end
 
-local function AcceptBestQuest()
-    local best = BestQuest()
-    if best then
-        print("[QF] Accepting:", best.info)
-        -- Quest:FireServer("RequestQuest", moduleRef, uid)
-        QuestBridge:Fire({ "RequestQuest", best.mod, best.q.UID })
-    else
-        print("[QF] No suitable quest available")
+-- Teleport near the NPC quest giver before accepting (server may check proximity)
+local function TPNearNPC(npcName)
+    local giverFolder = workspace:FindFirstChild("TalkNpc")
+    if not giverFolder then return end
+    local giverParent = giverFolder:FindFirstChild("QuestGiver")
+    if not giverParent then return end
+    local npc = giverParent:FindFirstChild(npcName)
+    if not npc then return end
+    local hrp = npc:FindFirstChild("HumanoidRootPart") or npc.PrimaryPart
+    if not hrp then return end
+    local r = Root()
+    if r then
+        r.CFrame = CFrame.new(hrp.Position + Vector3.new(3, 0, 3))
     end
 end
 
--- Replica: level + stat points (safe immediately, no Network dependency) -------
+local function AcceptQuest()
+    local questMod, npcName = GetQuestModuleForLevel(PlayerLevel)
+    if questMod then
+        print("[QF] Accepting quest from:", npcName)
+        TPNearNPC(npcName)
+        task.wait(0.3)
+        QuestBridge:Fire({ "RequestQuest", questMod })
+    else
+        print("[QF] No quest module found for level", PlayerLevel)
+    end
+end
+
+-- Replica: level + stat points -------------------------------------------------
 ReplicaCtrl.ReplicaOfClassCreated("DataToken_" .. LocalPlayer.UserId, function(replica)
     local team = LocalPlayer:GetAttribute("Team") or "GHOUL"
     local data = replica.Data[team]
@@ -124,38 +150,26 @@ ReplicaCtrl.ReplicaOfClassCreated("DataToken_" .. LocalPlayer.UserId, function(r
     PlayerLevel = data.Level or 1
     StatPoints  = data.StatPoint or 0
     replica:ListenToChange({ "Level" }, function(v)
-        if v > PlayerLevel then ShouldRepick = true end
         PlayerLevel = v
+        -- If we crossed a tier boundary mid-quest, abandon and re-accept
+        -- (handled automatically: AcceptQuest uses current PlayerLevel)
     end)
     replica:ListenToChange({ "StatPoint" }, function(v)
         StatPoints = v
     end)
 end)
 
--- Quest board data bridge
-QuestDataBridge:Connect(function(payload)
-    AvailableQuests = payload[1] or {}
-    CompletedUIDs   = {}
-    for _, q in AvailableQuests do
-        if q.isCompleted then CompletedUIDs[q.UID] = true end
-    end
-    ShouldRepick = true
-    print("[QF] Board refreshed —", #AvailableQuests, "quests")
-end)
-
--- Quest event bridge: server sends {eventType, ...args}
--- (QuestBridge is nil until we know the real bridge name — guarded below)
-if QuestBridge then QuestBridge:Connect(function(data)
+-- Quest event bridge
+QuestBridge:Connect(function(data)
     local ev = data[1]
     if ev == "QuestReceived" then
         CurrentQuest = data[2]
         QuestDone    = false
-        ShouldRepick = false
         if CurrentQuest then
             print("[QF] Quest:", CurrentQuest.QuestInfo, "| Goal:", CurrentQuest.Goal)
         end
     elseif ev == "QuestCompleted" then
-        print("[QF] Quest complete!")
+        print("[QF] Complete! Re-accepting immediately...")
         QuestDone    = true
         CurrentQuest = nil
     elseif ev == "QuestRemoved" then
@@ -164,7 +178,7 @@ if QuestBridge then QuestBridge:Connect(function(data)
     elseif ev == "QuestProgress" then
         print("[QF] Progress:", data[2], "/", data[3])
     end
-end) end
+end)
 
 -- Re-equip on respawn
 LocalPlayer.CharacterAdded:Connect(function()
@@ -174,55 +188,12 @@ LocalPlayer.CharacterAdded:Connect(function()
     print("[QF] Respawned — kagune equipped")
 end)
 
--- DEBUG: dump every registered BridgeNet2 bridge name + scan Network recursively
-task.spawn(function()
-    repeat task.wait(0.5) until LocalPlayer:GetAttribute("Loaded")
-    task.wait(2) -- let identifierStorage populate
-
-    -- BridgeNet2 identifier storage (name → GUID map)
-    local bn2 = ReplicatedStorage.Modules.Library.BridgeNet2
-    local idStore = bn2:FindFirstChild("identifierStorage")
-    if idStore then
-        print("[QF-DEBUG] BridgeNet2 registered bridges:")
-        for name, guid in idStore:GetAttributes() do
-            print("  BRIDGE:", name, "→", guid)
-        end
-    else
-        print("[QF-DEBUG] identifierStorage not found in BridgeNet2 module")
-    end
-
-    -- Full recursive scan of Network folder
-    local function scanFolder(folder, indent)
-        for _, child in folder:GetChildren() do
-            print(indent .. child.Name .. " [" .. child.ClassName .. "]")
-            if child:IsA("Folder") then
-                scanFolder(child, indent .. "  ")
-            end
-        end
-    end
-    local Network = ReplicatedStorage:FindFirstChild("Network")
-    if Network then
-        print("[QF-DEBUG] ReplicatedStorage.Network full tree:")
-        scanFolder(Network, "  ")
-    else
-        print("[QF-DEBUG] Network folder not found!")
-    end
-end)
-
--- Init gate: wait for player loaded, then unlock all loops ---------------------
+-- Init gate
 task.spawn(function()
     repeat task.wait(0.5) until LocalPlayer:GetAttribute("Loaded") and LocalPlayer:GetAttribute("Team")
     print("[QF] Ready | Level:", PlayerLevel, "| Team:", LocalPlayer:GetAttribute("Team"))
     EquipKagune()
     Initialized = true
-
-    task.delay(3, function()
-        if #AvailableQuests == 0 then
-            local r = Root()
-            if r then r.CFrame = CFrame.new(BOARD_POS) end
-            print("[QF] No board data yet — teleported to quest board")
-        end
-    end)
 end)
 
 -- Stat allocation --------------------------------------------------------------
@@ -275,31 +246,22 @@ task.spawn(function()
         local char = Char()
         if not char or not Root() then task.wait(1) continue end
 
-        if not CurrentQuest and not QuestDone then
-            if #AvailableQuests > 0 then
-                AcceptBestQuest()
-                task.wait(1.5)
-            else
-                task.wait(2)
-            end
-            continue
-        end
-
-        if QuestDone then
-            task.wait(2)
-            QuestDone    = false
-            ShouldRepick = true
-            continue
-        end
-
-        if ShouldRepick and not CurrentQuest then
-            ShouldRepick = false
-            AcceptBestQuest()
+        -- Accept / re-accept quest
+        if not CurrentQuest then
+            AcceptQuest()
             task.wait(1.5)
             continue
         end
 
-        if CurrentQuest and CurrentQuest.Target then
+        -- Brief rest after complete then instantly re-accept same tier
+        if QuestDone then
+            task.wait(1)
+            QuestDone = false
+            continue
+        end
+
+        -- Attack enemies
+        if CurrentQuest.Target then
             EquipKagune()
             local enemy = FindEnemy(CurrentQuest.Target)
             if enemy then
