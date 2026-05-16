@@ -215,7 +215,7 @@ end
 local function GetGairo()
     local Zombies = workspace:FindFirstChild("Zombies")
     if not Zombies then return nil end
-    return Zombies:FindFirstChild("Gairo")
+    return Zombies:FindFirstChild("Sorcerer")
 end
 
 -- Locate the left-leg part. Returns (Part, UseFallback). UseFallback=true means we
