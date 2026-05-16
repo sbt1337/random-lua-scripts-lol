@@ -46,6 +46,7 @@ local BLOCKING_STATES = { "LightAttack", "NoAttack", "Action", "Stun", "UsingMov
 
 -- State
 local Running = true
+local ClearingForceField = false   -- true while walking off spawn FF; pauses TPs
 local SlotCooldownEnd = { 0, 0, 0, 0, 0 }
 local GadgetCooldownEnd = 0
 local LastAttackAt = tick()
@@ -352,6 +353,9 @@ task.spawn(function()
             local Leg, UseFallback = GetGairoLeg(Gairo)
             if not Leg then return end
 
+            -- Pause TPs while walking off spawn ForceField
+            if ClearingForceField then return end
+
             local Pos = Leg.Position
             local TargetY = Pos.Y + LEG_Y_OFFSET + (UseFallback and -3 or 0)
             HRP.CFrame = CFrame.new(Pos.X, TargetY, Pos.Z)
@@ -577,6 +581,30 @@ task.spawn(function()
     end
 end)
 
+-- Walk off the spawn ForceField so it drops immediately.
+-- Roblox's FF persists until the character physically moves; the TP loop keeps
+-- repositioning us every 0.05s so we never actually move and the FF never clears.
+-- Solution: pause TPs, use Humanoid:MoveTo to physically walk forward for 2s, then resume.
+local function ClearSpawnForceField(Char, Hum, Hrp)
+    task.wait(0.15)  -- brief wait for FF instance to be added by server
+    if not Char or not Char.Parent then return end
+    local FF = Char:FindFirstChildOfClass("ForceField")
+    if not FF then return end  -- no FF on this spawn, skip
+
+    ClearingForceField = true
+    print("[GairoFarm] ForceField detected — walking to clear it")
+
+    -- Walk forward 20 studs; MoveTo lets Humanoid engine drive movement naturally
+    local WalkTarget = Hrp.Position + Hrp.CFrame.LookVector * 20
+    Hum:MoveTo(WalkTarget)
+    task.wait(2)
+
+    -- Stop in place
+    Hum:MoveTo(Hrp.Position)
+    ClearingForceField = false
+    print("[GairoFarm] ForceField cleared — resuming farm")
+end
+
 -- Character setup (initial + every respawn)
 local DiedConn = nil
 local function SetupCharacter(NewCharacter)
@@ -602,6 +630,7 @@ local function SetupCharacter(NewCharacter)
         end)
 
         HookReviveListener(NewCharacter)
+        task.spawn(ClearSpawnForceField, NewCharacter, Humanoid, HRP)
     end)
 end
 
