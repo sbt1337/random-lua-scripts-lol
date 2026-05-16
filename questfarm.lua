@@ -1,19 +1,18 @@
 -- Kanom Tokyo | Quest Autofarm (Ghoul - Nishiki)
--- Nothing blocks at top level — all remotes resolved after player Loaded
+-- All networking via BridgeNet2 (Network folder is GUID-named, no plain "Quest" child)
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local LocalPlayer       = Players.LocalPlayer
 
--- These are nil until init completes; loops wait on Initialized
-local QuestNet       = nil
-local UseSkillRemote = nil
-local StatBridge     = nil
-local Initialized    = false
-
--- Shared modules (safe to require immediately — they don't depend on Network)
 local BridgeNet2  = require(ReplicatedStorage.Modules.Library.BridgeNet2)
 local ReplicaCtrl = require(ReplicatedStorage.ReplicaController)
+
+-- BridgeNet2 bridges (resolved immediately — just a GUID lookup, no yielding)
+local QuestBridge    = BridgeNet2.ClientBridge("Quest")
+local UseSkillBridge = BridgeNet2.ClientBridge("UseSkill")
+local StatBridge     = BridgeNet2.ClientBridge("StatUpgrade")
+local QuestDataBridge = BridgeNet2.ClientBridge("QuestData")
 
 -- Config
 local DEFAULT_SKILL_CD = 8
@@ -23,16 +22,17 @@ local ATTACK_DIST      = 10
 local StatOrder        = { "Damage", "Durability" }
 
 -- Runtime state
-local Running        = true
+local Running         = true
 local AvailableQuests = {}
-local CompletedUIDs  = {}
-local CurrentQuest   = nil
-local QuestDone      = false
-local ShouldRepick   = false
-local PlayerLevel    = 1
-local StatPoints     = 0
-local StatIdx        = 1
-local SkillCooldowns = {}
+local CompletedUIDs   = {}
+local CurrentQuest    = nil
+local QuestDone       = false
+local ShouldRepick    = false
+local PlayerLevel     = 1
+local StatPoints      = 0
+local StatIdx         = 1
+local SkillCooldowns  = {}
+local Initialized     = false
 
 -- Helpers ----------------------------------------------------------------------
 local function Char() return LocalPlayer.Character end
@@ -61,8 +61,7 @@ end
 local function TPUnderEnemy(hrp)
     local r = Root()
     if not r then return end
-    local underPos = hrp.Position - Vector3.new(0, UNDER_DEPTH, 0)
-    r.CFrame = CFrame.new(underPos, hrp.Position)
+    r.CFrame = CFrame.new(hrp.Position - Vector3.new(0, UNDER_DEPTH, 0), hrp.Position)
 end
 
 local function EquipKagune()
@@ -108,13 +107,14 @@ local function AcceptBestQuest()
     local best = BestQuest()
     if best then
         print("[QF] Accepting:", best.info)
-        QuestNet:FireServer("RequestQuest", best.mod, best.q.UID)
+        -- Quest:FireServer("RequestQuest", moduleRef, uid)
+        QuestBridge:Fire({ "RequestQuest", best.mod, best.q.UID })
     else
-        print("[QF] No suitable quest right now")
+        print("[QF] No suitable quest available")
     end
 end
 
--- Replica (safe to set up immediately — doesn't touch Network) -----------------
+-- Replica: level + stat points (safe immediately, no Network dependency) -------
 ReplicaCtrl.ReplicaOfClassCreated("DataToken_" .. LocalPlayer.UserId, function(replica)
     local team = LocalPlayer:GetAttribute("Team") or "GHOUL"
     local data = replica.Data[team]
@@ -130,18 +130,40 @@ ReplicaCtrl.ReplicaOfClassCreated("DataToken_" .. LocalPlayer.UserId, function(r
     end)
 end)
 
--- Quest board data bridge (safe to connect immediately) ------------------------
-BridgeNet2.ClientBridge("QuestData"):Connect(function(payload)
+-- Quest board data bridge
+QuestDataBridge:Connect(function(payload)
     AvailableQuests = payload[1] or {}
     CompletedUIDs   = {}
     for _, q in AvailableQuests do
         if q.isCompleted then CompletedUIDs[q.UID] = true end
     end
     ShouldRepick = true
-    print("[QF] Quest board refreshed —", #AvailableQuests, "quests")
+    print("[QF] Board refreshed —", #AvailableQuests, "quests")
 end)
 
--- Re-equip on respawn ----------------------------------------------------------
+-- Quest event bridge: server sends {eventType, ...args}
+QuestBridge:Connect(function(data)
+    local ev = data[1]
+    if ev == "QuestReceived" then
+        CurrentQuest = data[2]
+        QuestDone    = false
+        ShouldRepick = false
+        if CurrentQuest then
+            print("[QF] Quest:", CurrentQuest.QuestInfo, "| Goal:", CurrentQuest.Goal)
+        end
+    elseif ev == "QuestCompleted" then
+        print("[QF] Quest complete!")
+        QuestDone    = true
+        CurrentQuest = nil
+    elseif ev == "QuestRemoved" then
+        CurrentQuest = nil
+        QuestDone    = false
+    elseif ev == "QuestProgress" then
+        print("[QF] Progress:", data[2], "/", data[3])
+    end
+end)
+
+-- Re-equip on respawn
 LocalPlayer.CharacterAdded:Connect(function()
     task.wait(3)
     repeat task.wait(0.2) until LocalPlayer:GetAttribute("Loaded")
@@ -149,80 +171,18 @@ LocalPlayer.CharacterAdded:Connect(function()
     print("[QF] Respawned — kagune equipped")
 end)
 
--- Init: resolve Network remotes after player is fully loaded -------------------
+-- Init gate: wait for player loaded, then unlock all loops ---------------------
 task.spawn(function()
     repeat task.wait(0.5) until LocalPlayer:GetAttribute("Loaded") and LocalPlayer:GetAttribute("Team")
-    print("[QF] Player loaded. Resolving Network remotes...")
-
-    local Network = ReplicatedStorage:FindFirstChild("Network")
-    if not Network then
-        -- poll until it appears (server creates it at runtime)
-        repeat task.wait(0.5)
-            Network = ReplicatedStorage:FindFirstChild("Network")
-        until Network
-    end
-    print("[QF] Network folder found. Waiting for remotes...")
-
-    -- Dump every child of Network so we can see the real names
-    print("[QF] Network children:")
-    for _, child in Network:GetChildren() do
-        print("  >>", child.Name, "|", child.ClassName)
-    end
-    -- Also watch for anything added later
-    Network.ChildAdded:Connect(function(child)
-        print("[QF] Network.ChildAdded:", child.Name, "|", child.ClassName)
-    end)
-
-    -- poll for each remote individually so we can report which one is missing
-    local deadline = tick() + 30
-    repeat task.wait(0.5)
-        QuestNet       = Network:FindFirstChild("Quest")
-        UseSkillRemote = Network:FindFirstChild("UseSkill")
-    until (QuestNet and UseSkillRemote) or tick() > deadline
-
-    if not QuestNet then
-        warn("[QF] Quest remote not found after 30s — aborting")
-        warn("[QF] Network children at timeout:")
-        for _, child in Network:GetChildren() do
-            warn("  >>", child.Name, "|", child.ClassName)
-        end
-        return
-    end
-    if not UseSkillRemote then
-        warn("[QF] UseSkill remote not found after 30s — skills disabled")
-    end
-
-    StatBridge = BridgeNet2.ClientBridge("StatUpgrade")
-
-    -- Hook quest events now that QuestNet is valid
-    QuestNet.OnClientEvent:Connect(function(ev, ...)
-        local a = { ... }
-        if ev == "QuestReceived" then
-            CurrentQuest = a[1]
-            QuestDone    = false
-            ShouldRepick = false
-            print("[QF] Quest:", CurrentQuest.QuestInfo, "| Goal:", CurrentQuest.Goal)
-        elseif ev == "QuestCompleted" then
-            print("[QF] Quest complete!")
-            QuestDone    = true
-            CurrentQuest = nil
-        elseif ev == "QuestRemoved" then
-            CurrentQuest = nil
-            QuestDone    = false
-        end
-    end)
-
-    Initialized = true
-    print("[QF] Init done | Level:", PlayerLevel, "| Team:", LocalPlayer:GetAttribute("Team"))
-
+    print("[QF] Ready | Level:", PlayerLevel, "| Team:", LocalPlayer:GetAttribute("Team"))
     EquipKagune()
+    Initialized = true
 
-    -- If no quest data in 3s, TP to board to nudge server
     task.delay(3, function()
         if #AvailableQuests == 0 then
             local r = Root()
             if r then r.CFrame = CFrame.new(BOARD_POS) end
-            print("[QF] No quest data — teleported to board")
+            print("[QF] No board data yet — teleported to quest board")
         end
     end)
 end)
@@ -232,7 +192,7 @@ task.spawn(function()
     repeat task.wait(0.5) until Initialized
     while Running do
         task.wait(0.8)
-        while StatPoints > 0 and StatBridge do
+        while StatPoints > 0 do
             local stat = StatOrder[StatIdx]
             StatBridge:Fire({ { stat, 1 } })
             StatIdx    = (StatIdx % #StatOrder) + 1
@@ -247,7 +207,7 @@ task.spawn(function()
     repeat task.wait(0.5) until Initialized
     while Running do
         task.wait(0.2)
-        if not CurrentQuest or not UseSkillRemote then continue end
+        if not CurrentQuest then continue end
         if not LocalPlayer:GetAttribute("isUsingWeapon") then continue end
         local char = Char()
         if not char or char:GetAttribute("SkillDisabled") then continue end
@@ -257,7 +217,7 @@ task.spawn(function()
         for _, name in GetLoadedSkillNames() do
             if (SkillCooldowns[name] or 0) > now then continue end
             local ok, result = pcall(function()
-                return UseSkillRemote:InvokeServer(name)
+                return UseSkillBridge:InvokeServerAsync(name)
             end)
             if ok and result then
                 SkillCooldowns[name] = now + DEFAULT_SKILL_CD
