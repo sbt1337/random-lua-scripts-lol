@@ -83,16 +83,33 @@ local function TPUnderEnemy(hrp)
     r.CFrame = CFrame.new(hrp.Position - Vector3.new(0, UNDER_DEPTH, 0), hrp.Position)
 end
 
--- Rate-limited toggle: ToggleWeapon is a flip-flop. Calling it twice in rapid
--- succession (before isUsingWeapon replicates back) equips then immediately unequips.
--- The 4s gate ensures we never double-fire it.
-local LastEquipAt = 0
+-- Equip kagune by directly invoking the weapon remote (sniffed from live traffic).
+-- GUID {92B28BAD-1E62-4CAF-A884-F0FF1110DE20} = OpenWeapon RemoteFunction in Network.
+-- Calling InvokeServer("Nishiki") is exactly what the game does on manual equip.
+-- No flip-flop race condition, no dependency on _G.ToggleWeapon internal state.
+-- Still rate-limited to 4s: Weapon.lua sets a 3s server-side cooldown on CharacterAdded.
+local WeaponRemoteGUID = "{92B28BAD-1E62-4CAF-A884-F0FF1110DE20}"
+local WeaponName       = "Nishiki"
+local LastEquipAt      = 0
+
+local WeaponRemote = nil  -- resolved once on init
+local function GetWeaponRemote()
+    if WeaponRemote and WeaponRemote.Parent then return WeaponRemote end
+    WeaponRemote = ReplicatedStorage.Network:FindFirstChild(WeaponRemoteGUID)
+    return WeaponRemote
+end
+
 local function EquipKagune()
     if LocalPlayer:GetAttribute("isUsingWeapon") then return end
-    if not _G.ToggleWeapon then return end
     if tick() - LastEquipAt < 4 then return end
+    local remote = GetWeaponRemote()
+    if not remote then
+        warn("[QF] Weapon remote not found — GUID may have changed")
+        return
+    end
     LastEquipAt = tick()
-    _G.ToggleWeapon()
+    local ok, err = pcall(function() remote:InvokeServer(WeaponName) end)
+    if not ok then warn("[QF] EquipKagune error:", err) end
     task.wait(1.5)
 end
 
