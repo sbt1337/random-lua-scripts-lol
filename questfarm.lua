@@ -4,6 +4,7 @@
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService      = game:GetService("TweenService")
 local LocalPlayer       = Players.LocalPlayer
 
 -- BridgeNet2 module — safe to require immediately
@@ -20,7 +21,8 @@ local Initialized    = false
 -- Config
 local DEFAULT_SKILL_CD = 8    -- seconds per skill, server overrides via cooldown listener
 local UNDER_DEPTH      = 5    -- studs below enemy HRP
-local ATTACK_DIST      = 10   -- TP threshold
+local ATTACK_DIST      = 10   -- tween threshold (studs) before attacking
+local TWEEN_SPEED      = 150  -- studs/sec — fast enough to be practical, slow enough to not flag
 local StatOrder        = { "Damage", "Durability" }   -- balanced alternation
 
 -- Level → quest giver NPC name (maps to TalkNpc.Quests[name].Quest module)
@@ -59,6 +61,20 @@ local function Root()
     return c and c:FindFirstChild("HumanoidRootPart")
 end
 
+-- Smooth movement: tween HRP to targetCFrame at TWEEN_SPEED studs/sec.
+-- Instant CFrame sets get flagged by velocity-based anticheat; tweening
+-- keeps per-frame position delta within believable range.
+local function TweenTo(targetCFrame)
+    local r = Root()
+    if not r then return end
+    local dist = (r.Position - targetCFrame.Position).Magnitude
+    if dist < 0.5 then return end
+    local duration = dist / TWEEN_SPEED
+    local tw = TweenService:Create(r, TweenInfo.new(duration, Enum.EasingStyle.Linear), {CFrame = targetCFrame})
+    tw:Play()
+    tw.Completed:Wait()
+end
+
 local function FindEnemy(targets)
     local r = Root()
     if not r then return nil end
@@ -77,10 +93,8 @@ local function FindEnemy(targets)
 end
 
 local function TPUnderEnemy(hrp)
-    local r = Root()
-    if not r then return end
-    -- 5 studs below, pitched upward at enemy so forward hitbox offset hits them
-    r.CFrame = CFrame.new(hrp.Position - Vector3.new(0, UNDER_DEPTH, 0), hrp.Position)
+    -- Tween to 5 studs below enemy, pitched up so Nishiki's forward hitbox offset hits
+    TweenTo(CFrame.new(hrp.Position - Vector3.new(0, UNDER_DEPTH, 0), hrp.Position))
 end
 
 -- Kagune equip: replicate all 3 remotes captured from live traffic.
@@ -197,10 +211,9 @@ local function AcceptQuest()
     local hrp = npc:FindFirstChild("HumanoidRootPart") or npc.PrimaryPart
     if not hrp then return end
 
-    -- TP within interaction range (NpcDialogue closes if > 20 studs away)
-    local r = Root()
-    if r then r.CFrame = CFrame.new(hrp.Position + Vector3.new(3, 0, 0)) end
-    task.wait(0.3)
+    -- Tween within interaction range (NpcDialogue closes if > 20 studs away)
+    TweenTo(CFrame.new(hrp.Position + Vector3.new(3, 0, 0)))
+    task.wait(0.2)
 
     -- Fire the ProximityPrompt the NpcDialogue system attached to the NPC
     local prompt = hrp:FindFirstChildOfClass("ProximityPrompt")
@@ -304,21 +317,20 @@ local function TryCollectNearby()
         local dist = (r.Position - part.Position).Magnitude
         if dist > 60 then continue end
 
-        -- TP close
+        -- Tween close before triggering
         if dist > 4 then
-            r.CFrame = CFrame.new(part.Position + Vector3.new(2, 0, 2))
-            task.wait(0.2)
+            TweenTo(CFrame.new(part.Position + Vector3.new(2, 0, 2)))
         end
 
-        -- Trigger via executor fireproximityprompt if available, else touch approach
+        -- Trigger via executor fireproximityprompt
         local ok = pcall(function()
             if fireproximityprompt then
                 fireproximityprompt(prompt)
             end
         end)
         if not ok then
-            -- Fallback: overlap touch by positioning on part
-            if r then r.CFrame = CFrame.new(part.Position) end
+            -- Fallback: tween onto part
+            TweenTo(CFrame.new(part.Position))
         end
         task.wait(0.3)
         return  -- one at a time
