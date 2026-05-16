@@ -1,44 +1,66 @@
--- Kanom Tokyo | Quest Autofarm (Ghoul)
--- Picks best level-appropriate quest from the board, kills targets, repeats.
+-- Kanom Tokyo | Quest Autofarm (Ghoul - Nishiki)
+-- * Auto-accepts best level-appropriate quest from the board
+-- * Attacks from 5 studs underground, facing up at enemy (hitbox offset hits through floor)
+-- * Auto-fires Tail Whip skill with local cooldown guard
+-- * Alternates Damage / Durability stat allocation when points are available
+-- * Re-equips kagune on respawn and whenever it drops mid-fight
 
-local Players         = game:GetService("Players")
+local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local LocalPlayer     = Players.LocalPlayer
-local Network         = ReplicatedStorage.Network
-local QuestNet        = Network.Quest
-local UseSkillRemote  = Network.UseSkill
-local QuestBoardDB    = ReplicatedStorage.Modules.DataBase.QuestBoard
-local BridgeNet2      = require(ReplicatedStorage.Modules.Library.BridgeNet2)
-local ReplicaCtrl     = require(ReplicatedStorage.ReplicaController)
+local LocalPlayer       = Players.LocalPlayer
+local QuestNet          = ReplicatedStorage.Network.Quest
+local UseSkillRemote    = ReplicatedStorage.Network.UseSkill
+local QuestBoardDB      = ReplicatedStorage.Modules.DataBase.QuestBoard
+local BridgeNet2        = require(ReplicatedStorage.Modules.Library.BridgeNet2)
+local ReplicaCtrl       = require(ReplicatedStorage.ReplicaController)
 
--- Variables
+-- Config
+local SKILL_NAME  = "Tail Whip"
+local SKILL_CD    = 8       -- seconds; server rejects early if still on CD, safe to retry
+local BOARD_POS   = Vector3.new(-240, 34, 208)
+local UNDER_DEPTH = 5       -- studs below enemy HRP
+local ATTACK_DIST = 10      -- re-TP if farther than this
 
-local Running         = true
-local AvailableQuests = {}
-local CompletedUIDs   = {}
-local CurrentQuest    = nil   -- data from QuestReceived: {QuestInfo, Goal, Target, Type}
-local QuestDone       = false
-local PlayerLevel     = 1
-local WeaponToggled   = false -- did we fire ToggleWeapon at least once this equip cycle
+-- Stat alternation: Damage first, then Durability, repeat
+local StatOrder = { "Damage", "Durability" }
+local StatIdx   = 1
 
--- Quest board NPC is physically around here; TP nearby to trigger server re-send if needed
-local BOARD_POS = Vector3.new(-240, 34, 208)
+-- Runtime state
+local Running           = true
+local AvailableQuests   = {}
+local CompletedUIDs     = {}
+local CurrentQuest      = nil   -- set by QuestReceived event: {QuestInfo, Goal, Target, ...}
+local QuestDone         = false
+local ShouldRepick      = false
+local PlayerLevel       = 1
+local StatPoints        = 0
+local TailWhipEnd       = 0
 
--- Priority: skip player-kill quests (arena), skip already-completed UIDs
--- Among the rest, pick highest LevelRequired (= most EXP)
+local StatBridge = BridgeNet2.ClientBridge("StatUpgrade")
 
--- Level tracking via Replica ----------------------------------------------------
+-- Replica: level + stat point tracking ----------------------------------------
 ReplicaCtrl.ReplicaOfClassCreated("DataToken_" .. LocalPlayer.UserId, function(replica)
     local team = LocalPlayer:GetAttribute("Team") or "GHOUL"
     local data  = replica.Data[team]
-    if data then
-        PlayerLevel = data.Level or 1
-        replica:ListenToChange({ "Level" }, function(v) PlayerLevel = v end)
-    end
+    if not data then return end
+
+    PlayerLevel = data.Level    or 1
+    StatPoints  = data.StatPoint or 0
+
+    replica:ListenToChange({ "Level" }, function(v)
+        if v > PlayerLevel then
+            ShouldRepick = true   -- level up: try for a higher quest next chance
+        end
+        PlayerLevel = v
+    end)
+
+    replica:ListenToChange({ "StatPoint" }, function(v)
+        StatPoints = v
+    end)
 end)
 
--- Quest board data (server fires this on join and on hourly reset) ----------------
+-- Quest board data (server fires on join + hourly reset) -----------------------
 BridgeNet2.ClientBridge("QuestData"):Connect(function(payload)
     AvailableQuests = payload[1] or {}
     CompletedUIDs   = {}
@@ -47,137 +69,176 @@ BridgeNet2.ClientBridge("QuestData"):Connect(function(payload)
             CompletedUIDs[q.UID] = true
         end
     end
+    ShouldRepick = true
 end)
 
--- Quest event listener -----------------------------------------------------------
+-- Quest event listener ---------------------------------------------------------
 QuestNet.OnClientEvent:Connect(function(ev, ...)
     local a = { ... }
     if ev == "QuestReceived" then
-        CurrentQuest  = a[1]   -- {QuestInfo, Goal, Target, Type, Rewards, ...}
-        QuestDone     = false
+        CurrentQuest = a[1]
+        QuestDone    = false
+        ShouldRepick = false
         print("[QF] Quest:", CurrentQuest.QuestInfo, "| Goal:", CurrentQuest.Goal)
-    elseif ev == "QuestProgress" then
-        -- a[1]=current, a[2]=goal (already tracked server-side, just log)
     elseif ev == "QuestCompleted" then
         print("[QF] Quest complete!")
         QuestDone    = true
         CurrentQuest = nil
-        WeaponToggled = false
     elseif ev == "QuestRemoved" then
-        CurrentQuest  = nil
-        QuestDone     = false
-        WeaponToggled = false
+        CurrentQuest = nil
+        QuestDone    = false
     end
 end)
 
--- Helpers -----------------------------------------------------------------------
-
-local function Character()
-    return LocalPlayer.Character
-end
-
+-- Helpers ----------------------------------------------------------------------
+local function Char() return LocalPlayer.Character end
 local function Root()
-    local c = Character()
+    local c = Char()
     return c and c:FindFirstChild("HumanoidRootPart")
 end
 
-local function SafeTP(pos)
-    local r = Root()
-    if r then
-        r.CFrame = CFrame.new(pos)
-    end
-end
-
--- Accept best quest from the board based on player level -------------------------
-local function AcceptBestQuest()
-    if #AvailableQuests == 0 then return end
-
-    local best, bestLevel = nil, -1
-
+-- Pick the highest LevelRequired non-player-kill quest we qualify for
+local function BestQuest()
+    if #AvailableQuests == 0 then return nil end
+    local best, bestLv = nil, -1
     for _, q in AvailableQuests do
         if CompletedUIDs[q.UID] then continue end
-
         local mod = QuestBoardDB:FindFirstChild(q.QuestName, true)
         if not mod then continue end
-
         local ok, data = pcall(require, mod)
         if not ok then continue end
-
-        local targets      = data.Target or {}
-        local isPlayerKill = table.find(targets, "Player")
-        local levelReq     = data.LevelRequired or 0
-
-        if not isPlayerKill and levelReq <= PlayerLevel and levelReq > bestLevel then
-            bestLevel = levelReq
-            best = { q = q, mod = mod, name = data.QuestInfo }
+        local targets = data.Target or {}
+        if table.find(targets, "Player") then continue end
+        local lv = data.LevelRequired or 0
+        if lv <= PlayerLevel and lv > bestLv then
+            bestLv = lv
+            best   = { q = q, mod = mod, info = data.QuestInfo }
         end
     end
-
-    if best then
-        print("[QF] Accepting:", best.name)
-        QuestNet:FireServer("RequestQuest", best.mod, best.q.UID)
-    else
-        print("[QF] No suitable quest available (all done or level too low?)")
-    end
-end
-
--- Find nearest alive enemy matching any of the target names ----------------------
-local function FindEnemy(targets)
-    local r = Root()
-    if not r then return nil end
-
-    local aiFolder = workspace["AI/Player"]
-    local best, bestDist = nil, math.huge
-
-    for _, m in aiFolder:GetChildren() do
-        if not m:IsA("Model") then continue end
-        if not table.find(targets, m.Name) then continue end
-
-        local hrp = m:FindFirstChild("HumanoidRootPart")
-        local hum = m:FindFirstChildOfClass("Humanoid")
-        if not hrp or not hum or hum.Health <= 0 then continue end
-
-        local d = (r.Position - hrp.Position).Magnitude
-        if d < bestDist then
-            bestDist = d
-            best = m
-        end
-    end
-
     return best
 end
 
--- Ensure weapon is drawn. ToggleWeapon flips state, so only call it when sheathed.
-local function EnsureWeapon()
-    if not LocalPlayer:GetAttribute("isUsingWeapon") then
-        if not WeaponToggled then
-            _G.ToggleWeapon()
-            WeaponToggled = true
-            task.wait(0.5)
-        end
+local function AcceptBestQuest()
+    local best = BestQuest()
+    if best then
+        print("[QF] Accepting:", best.info)
+        QuestNet:FireServer("RequestQuest", best.mod, best.q.UID)
     else
-        WeaponToggled = true
+        print("[QF] No suitable quest found (board may need to refresh)")
     end
 end
 
--- Main loop ----------------------------------------------------------------------
+-- Find nearest alive enemy matching quest targets inside workspace["AI/Player"]
+local function FindEnemy(targets)
+    local r = Root()
+    if not r then return nil end
+    local aiFolder = workspace["AI/Player"]
+    local best, bestDist = nil, math.huge
+    for _, m in aiFolder:GetChildren() do
+        if not m:IsA("Model") or not table.find(targets, m.Name) then continue end
+        local hrp = m:FindFirstChild("HumanoidRootPart")
+        local hum = m:FindFirstChildOfClass("Humanoid")
+        if not hrp or not hum or hum.Health <= 0 then continue end
+        local d = (r.Position - hrp.Position).Magnitude
+        if d < bestDist then
+            bestDist = d
+            best     = m
+        end
+    end
+    return best
+end
+
+-- TP 5 studs below enemy, look up at them so the Nishiki hitbox (forward offset)
+-- extends upward into the enemy's collision box
+local function TPUnderEnemy(hrp)
+    local r = Root()
+    if not r then return end
+    local underPos = hrp.Position - Vector3.new(0, UNDER_DEPTH, 0)
+    -- CFrame.new(pos, lookAt) pitches us upward toward the enemy
+    r.CFrame = CFrame.new(underPos, hrp.Position)
+end
+
+-- Equip kagune if it's currently sheathed
+local function EquipKagune()
+    if not LocalPlayer:GetAttribute("isUsingWeapon") then
+        if _G.ToggleWeapon then
+            _G.ToggleWeapon()
+            task.wait(0.5)
+        end
+    end
+end
+
+-- Auto-reequip on respawn
+LocalPlayer.CharacterAdded:Connect(function()
+    task.wait(3)
+    repeat task.wait(0.2) until LocalPlayer:GetAttribute("Loaded")
+    EquipKagune()
+    print("[QF] Respawned — kagune re-equipped")
+end)
+
+-- Stat allocation thread -------------------------------------------------------
 task.spawn(function()
-    -- Wait until player data is loaded
+    repeat task.wait(0.5) until LocalPlayer:GetAttribute("Loaded")
+    while Running do
+        task.wait(0.8)
+        while StatPoints > 0 do
+            local stat = StatOrder[StatIdx]
+            StatBridge:Fire({ { stat, 1 } })
+            StatIdx    = (StatIdx % #StatOrder) + 1
+            StatPoints -= 1   -- optimistic; replica confirms actual value
+            task.wait(0.3)
+        end
+    end
+end)
+
+-- Skill thread -----------------------------------------------------------------
+task.spawn(function()
+    repeat task.wait(0.5) until LocalPlayer:GetAttribute("Loaded")
+    while Running do
+        task.wait(0.15)
+
+        if not CurrentQuest then continue end
+        if not LocalPlayer:GetAttribute("isUsingWeapon") then continue end
+        if tick() < TailWhipEnd then continue end
+
+        local char = Char()
+        if not char or char:GetAttribute("SkillDisabled") then continue end
+
+        local enemy = FindEnemy(CurrentQuest.Target)
+        if not enemy then continue end
+
+        local ok, result = pcall(function()
+            return UseSkillRemote:InvokeServer(SKILL_NAME)
+        end)
+        if ok and result then
+            TailWhipEnd = tick() + SKILL_CD
+            print("[QF] Tail Whip")
+        elseif not ok then
+            TailWhipEnd = tick() + 2   -- small backoff on error
+        end
+    end
+end)
+
+-- Main farm loop ---------------------------------------------------------------
+task.spawn(function()
     repeat task.wait(0.5) until LocalPlayer:GetAttribute("Loaded") and LocalPlayer:GetAttribute("Team")
 
-    -- If QuestData hasn't arrived in 3s, walk near the board to nudge the server
+    EquipKagune()
+
+    -- Fallback: if no quest data arrives in 3s, walk to the board so server re-sends
     task.delay(3, function()
         if #AvailableQuests == 0 then
-            SafeTP(BOARD_POS)
-            print("[QF] Teleported to quest board to trigger data refresh...")
+            local r = Root()
+            if r then r.CFrame = CFrame.new(BOARD_POS) end
+            print("[QF] No quest data yet — teleported to board to trigger refresh")
         end
     end)
 
     while Running do
-        local char = Character()
+        local char = Char()
         if not char or not Root() then task.wait(1) continue end
 
-        -- No quest — try to accept one
+        -- No quest: accept best available
         if not CurrentQuest and not QuestDone then
             if #AvailableQuests > 0 then
                 AcceptBestQuest()
@@ -188,38 +249,43 @@ task.spawn(function()
             continue
         end
 
-        -- Quest just completed — brief cooldown then accept next
+        -- Just completed: short pause then repick (level up might open a better tier)
         if QuestDone then
             task.wait(2)
-            QuestDone = false
+            QuestDone    = false
+            ShouldRepick = true
             continue
         end
 
-        -- Active quest — find enemy and attack
-        if CurrentQuest and CurrentQuest.Target then
-            local enemy = FindEnemy(CurrentQuest.Target)
+        -- Level-up flagged and quest just finished: try higher tier
+        if ShouldRepick and not CurrentQuest then
+            ShouldRepick = false
+            AcceptBestQuest()
+            task.wait(1.5)
+            continue
+        end
 
+        -- Active quest: find, sink below, swing
+        if CurrentQuest and CurrentQuest.Target then
+            EquipKagune()
+
+            local enemy = FindEnemy(CurrentQuest.Target)
             if enemy then
                 local hrp = enemy:FindFirstChild("HumanoidRootPart")
                 if hrp then
+                    -- Re-TP only when we've drifted out of ATTACK_DIST
                     local r = Root()
-                    if r and (r.Position - hrp.Position).Magnitude > 7 then
-                        -- TP directly behind/beside the enemy
-                        local offset = hrp.CFrame.LookVector * -4
-                        SafeTP(hrp.Position + Vector3.new(offset.X, 0, offset.Z))
+                    if r and (r.Position - hrp.Position).Magnitude > ATTACK_DIST then
+                        TPUnderEnemy(hrp)
                     end
 
-                    EnsureWeapon()
-
-                    -- _G.Attack() yields until animation finishes, naturally pacing attacks
                     if _G.Attack then
-                        _G.Attack()
+                        _G.Attack()   -- yields until animation marker fires
                     else
                         task.wait(0.1)
                     end
                 end
             else
-                -- No living target found yet — wait for one to spawn
                 task.wait(0.4)
             end
         else
@@ -228,4 +294,4 @@ task.spawn(function()
     end
 end)
 
-print("[QF] Quest autofarm loaded. Level:", PlayerLevel, "| Team:", LocalPlayer:GetAttribute("Team") or "?")
+print("[QF] Quest autofarm started | Level:", PlayerLevel, "| Team:", LocalPlayer:GetAttribute("Team") or "?")
