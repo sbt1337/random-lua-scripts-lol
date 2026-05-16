@@ -223,14 +223,25 @@ local function TryCollectNearby()
 end
 
 -- Replica: level + stat points -------------------------------------------------
-ReplicaCtrl.ReplicaOfClassCreated("DataToken_" .. LocalPlayer.UserId, function(replica)
-    local team = LocalPlayer:GetAttribute("Team") or "GHOUL"
-    local data = replica.Data[team]
-    if not data then return end
-    PlayerLevel = data.Level or 1
-    StatPoints  = data.StatPoint or 0
-    replica:ListenToChange({ "Level" }, function(v) PlayerLevel = v end)
-    replica:ListenToChange({ "StatPoint" }, function(v) StatPoints = v end)
+-- Wrapped in pcall: some executor environments sandbox ReplicaController so
+-- the module loads but returns nil, which would error on the :ReplicaOfClassCreated call.
+pcall(function()
+    ReplicaCtrl.ReplicaOfClassCreated("DataToken_" .. LocalPlayer.UserId, function(replica)
+        local team = LocalPlayer:GetAttribute("Team") or "GHOUL"
+        local data = replica.Data[team]
+        if not data then
+            warn("[QF] DataToken: no data for team", team)
+            return
+        end
+        PlayerLevel = data.Level or 1
+        StatPoints  = data.StatPoint or 0
+        print("[QF] DataToken loaded — Level:", PlayerLevel, "StatPoints:", StatPoints)
+        replica:ListenToChange({ "Level" }, function(v)
+            PlayerLevel = v
+            print("[QF] Level up →", v)
+        end)
+        replica:ListenToChange({ "StatPoint" }, function(v) StatPoints = v end)
+    end)
 end)
 
 -- Re-equip on respawn ----------------------------------------------------------
@@ -249,7 +260,22 @@ end)
 --   game.ReplicatedStorage.BridgeNet2.identifierStorage
 -- (a folder named "BridgeNet2" created directly in RS root, NOT in Modules.Library.BridgeNet2)
 task.spawn(function()
-    repeat task.wait(0.5) until LocalPlayer:GetAttribute("Loaded") and LocalPlayer:GetAttribute("Team")
+    print("[QF] Init spawn alive — waiting for character...")
+
+    -- Wait for a playable character (HRP = character is actually loaded in world)
+    if not LocalPlayer.Character then LocalPlayer.CharacterAdded:Wait() end
+    local char = LocalPlayer.Character
+    while not char:FindFirstChild("HumanoidRootPart") do task.wait(0.2) end
+
+    -- Team attribute: set server-side before DataToken replica.
+    -- Give it up to 15s, then default to GHOUL so we never stall.
+    local teamWait = 0
+    while not LocalPlayer:GetAttribute("Team") and teamWait < 15 do
+        task.wait(0.5)
+        teamWait += 0.5
+    end
+    local team = LocalPlayer:GetAttribute("Team") or "GHOUL"
+    print("[QF] Team:", team, "| Attrs — Loaded:", LocalPlayer:GetAttribute("Loaded"), "Team:", team)
 
     print("[QF] Waiting for BridgeNet2 identifierStorage...")
     local bn2Folder = ReplicatedStorage:WaitForChild("BridgeNet2", 120)
