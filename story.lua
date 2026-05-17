@@ -1,3 +1,13 @@
+-- StoryFarm — rewritten from decompile analysis
+-- Patterns lifted from working infinity.lua + gairo.lua:
+--   - M1 fire every 0.42s (decompile: u302=0.4 in MB1 handler)
+--   - Direct workspace.Zombies:GetChildren() — zombies are direct children
+--   - Health.Value > 0 = ALIVE (LiveRadar/Handler.lua:190)
+--   - All 5 ability slots (Z=1, X=2, C=3, V=4, G=5)
+--   - Gadget (E) + Special (Q) fired alongside
+--   - TP onto target, no underground hiding (kills throughput)
+--   - GateHit for section advance (SetupGate at _LocalFX.lua:17418)
+
 if game.PlaceId == 140409475718339 then return end
 
 local Players           = game:GetService("Players")
@@ -8,67 +18,41 @@ local HttpService       = game:GetService("HttpService")
 local CollectionService = game:GetService("CollectionService")
 
 local LocalPlayer = Players.LocalPlayer
-local Character   = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-local Humanoid    = Character:WaitForChild("Humanoid")
-local HRP         = Character:WaitForChild("HumanoidRootPart")
 
-do
-    local VirtualUser = game:GetService("VirtualUser")
-    LocalPlayer.Idled:Connect(function()
-        pcall(function()
-            VirtualUser:CaptureController()
-            VirtualUser:ClickButton2(Vector2.new())
-        end)
-        print("[StoryFarm] Anti-AFK: simulated input")
-    end)
-end
-
--- Session token: incremented each execution so old loops can detect a reload and break
+-- ─── SESSION TOKEN ───────────────────────────────────────────────────────────
+-- Increment global on each load. Old loops detect mismatch and break, so
+-- reload doesn't leave zombies of itself running.
 _G.StoryFarmSession = (_G.StoryFarmSession or 0) + 1
 local MySession = _G.StoryFarmSession
 local function Alive() return _G.StoryFarmSession == MySession end
 
-local Running             = true
-local Attacking           = false
-local AttackStartTime     = 0
-local CurrentTarget       = nil
-local SlotCooldownEnd     = { 0, 0, 0, 0 }
-local LastDamageAt        = 0
-local LastSeenHP          = nil
-local LastAttackAt        = tick()
+-- ─── CHARACTER ───────────────────────────────────────────────────────────────
+local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local Humanoid  = Character:WaitForChild("Humanoid")
+local HRP       = Character:WaitForChild("HumanoidRootPart")
 
--- HP baseline for no-damage skip (persists across loop iterations on the same target)
-local ActiveTargetHPBaseline = nil
-local ActiveTargetBaselineAt = nil
+local function IsCharValid()
+    return Character and Character.Parent
+        and Humanoid and Humanoid.Parent and Humanoid.Health > 0
+        and HRP and HRP.Parent
+end
 
-local Stats = {
-    AttacksAttempted = 0,
-    AttacksAborted   = 0,
-    MatchesCompleted = 0,
-    Rebirths         = 0,
-    TotalKills       = 0,
-    TotalDamage      = 0,
-    StartTime        = tick(),
-}
-
+-- ─── CONFIG ──────────────────────────────────────────────────────────────────
 local WEBHOOK     = "https://discord.com/api/webhooks/1503857688118034662/H3y9e9EUyyZyRnKCQ-X_eIdRpejU8OwStg22dzEoycfGt__iAhRTYmnumIenbFWEckS7"
 local LOG_WEBHOOK = "https://discord.com/api/webhooks/1504232139749720074/D_Oe_5gwVDguw2eUeqZbKvpmxBLeajcEZxClzS4tvyAyS80zlL3iOLHsrpOTXUsh_gdu"
 local RAW_URL     = "https://raw.githubusercontent.com/sbt1337/random-lua-scripts-lol/refs/heads/main/story.lua"
 
-local UNDERGROUND_Y          = 10
-local ATTACK_HEIGHT          = 5
-local ATTACK_TIMEOUT         = 4
-local STATS_INTERVAL         = 1800
-local AOE_RADIUS             = 12
-local ATTACK_WINDOW          = 0.8
-local POST_DAMAGE_LOCKOUT    = 1.5
-local DAMAGE_ABORT_THRESHOLD = 0.15
-local DAMAGE_GRACE_PERIOD    = 0.15
-local NO_DAMAGE_TIMEOUT      = 10   -- seconds on a target with no HP change → skip it
-local SKIP_DURATION          = 30   -- how long to leave it on the skip list
-
--- Weak-keyed: if SkipUntil[model] > tick(), don't pick that model
-local SkipUntil = setmetatable({}, { __mode = "k" })
+local M1_CD              = 0.42   -- decompile says 0.4 + small buffer
+local SLOT_SOFT_CD       = 0.4    -- until UsedAbility event confirms real CD
+local GADGET_CD          = 0.5
+local SPECIAL_SOFT_CD    = 1
+local SLOT_COUNT         = 5
+local TP_RANGE_MAX       = 8      -- TP onto target if further than this
+local NO_DAMAGE_TIMEOUT  = 10     -- skip target after this many seconds of no HP change
+local SKIP_DURATION      = 30
+local HEARTBEAT_INTERVAL = 30
+local STATS_INTERVAL     = 1800
+local IDLE_GATE_THRESHOLD = 3     -- zombies=0 for this long → fire gates
 
 local BLOCKING_STATES = { "LightAttack", "NoAttack", "Action", "Stun", "UsingMove" }
 
@@ -80,12 +64,47 @@ local REBIRTH_STEPS = {
     { RequiredLevel = 50, CoinsRequired = 12500000 },
 }
 
-print("[StoryFarm] Loaded")
+local CARD_PRIORITY = { "DMG", "GadgetMastery", "Wealth", "ExtraLife", "Agility" }
 
--- Log webhook (batch + flush every 3s)
+-- ─── STATE ───────────────────────────────────────────────────────────────────
+local Running              = true
+local CurrentTarget        = nil
+
+local ShowcasingSlot, ShowcasingAbility
+local GadgetSlotKey, GadgetName
+local SpecialSlotKey, SpecialName
+
+local SlotCooldownEnd   = { 0, 0, 0, 0, 0 }
+local GadgetCooldownEnd = 0
+local SpecialCooldownEnd = 0
+local LastM1            = 0
+local LastAttackAt      = tick()
+local LastDamageAt      = 0
+local LastSeenHP        = nil
+
+-- Per-target no-damage tracking
+local ActiveTargetHPBaseline = nil
+local ActiveTargetBaselineAt = nil
+local SkipUntil = setmetatable({}, { __mode = "k" })
+
+local Stats = {
+    M1               = 0,
+    AbilitiesFired   = 0,
+    GadgetsFired     = 0,
+    SpecialsFired    = 0,
+    MatchesCompleted = 0,
+    Rebirths         = 0,
+    Revives          = 0,
+    Cards            = 0,
+    GatesFired       = 0,
+    StartTime        = tick(),
+}
+
+print("[StoryFarm] Loaded (session " .. MySession .. ")")
+
+-- ─── LOG WEBHOOK ─────────────────────────────────────────────────────────────
 local LogBuffer = {}
 local RawPrint  = print
-local LogStats  = { Sent = 0, Failed = 0, Dropped = 0 }
 
 local function FlushLogs()
     if #LogBuffer == 0 then return end
@@ -105,24 +124,18 @@ local function FlushLogs()
     local Payload = table.concat(Lines, "\n")
     if #Payload == 0 then return end
     local RequestFunc = (syn and syn.request) or request or http_request
-    if not RequestFunc then
-        LogStats.Dropped = LogStats.Dropped + #Lines
-        return
-    end
-    local ok = pcall(function()
-        local Body = HttpService:JSONEncode({
-            username = "StoryFarm Logs",
-            content  = "```" .. Payload .. "```",
-        })
+    if not RequestFunc then return end
+    pcall(function()
         RequestFunc({
             Url     = LOG_WEBHOOK,
             Method  = "POST",
             Headers = { ["Content-Type"] = "application/json" },
-            Body    = Body,
+            Body    = HttpService:JSONEncode({
+                username = "StoryFarm Logs",
+                content  = "```" .. Payload .. "```",
+            }),
         })
     end)
-    if ok then LogStats.Sent   = LogStats.Sent   + #Lines
-    else       LogStats.Failed = LogStats.Failed + #Lines end
 end
 
 print = function(...)
@@ -143,108 +156,18 @@ task.spawn(function()
     end
 end)
 
--- Forward-declared so the heartbeat (below) can reference it before the real definition
+-- ─── ERROR HANDLING + WEBHOOK ────────────────────────────────────────────────
 local SendWebhook
 
-local LastStuckAlarm = 0
-task.spawn(function()
-    while true do
-        task.wait(30)
-        if not Alive() then break end
-        pcall(function()
-            local Folder      = workspace:FindFirstChild("Zombies")
-            local InFolder    = Folder and #Folder:GetDescendants() or 0
-            local SinceAttack = math.floor(tick() - LastAttackAt)
-            local GF = workspace:FindFirstChild("GameFinished")    and "Y" or "N"
-            local SS = workspace:FindFirstChild("SwitchingSection") and "Y" or "N"
-            local CS = workspace:FindFirstChild("Cutscene")         and "Y" or "N"
-
-            -- MatchConfig diagnostics
-            local Section  = "?"
-            local MC = workspace:FindFirstChild("MatchConfig")
-            if MC then
-                local SecVal = MC:FindFirstChild("CurrentSection")
-                if SecVal then Section = tostring(SecVal.Value) end
-            end
-
-            -- Gate diagnostics
-            local Gates      = CollectionService:GetTagged("GateHitbox")
-            local GateOpen   = 0
-            local GateClosed = 0
-            for _, G in ipairs(Gates) do
-                if G and G.Parent then
-                    if G.Parent:GetAttribute("Opened") then GateOpen  += 1
-                    else                                     GateClosed += 1 end
-                end
-            end
-
-            -- Objectives diagnostics
-            local ObjStrs  = {}
-            local ObjFolder = workspace:FindFirstChild("Objectives")
-            if ObjFolder then
-                for _, Obj in ipairs(ObjFolder:GetChildren()) do
-                    local MaxV = Obj:GetAttribute("MaxValue")
-                    local Val  = pcall(function() return Obj.Value end) and Obj.Value or "?"
-                    local Disp = MaxV and (tostring(MaxV) .. "->" .. tostring(Val)) or tostring(Val)
-                    table.insert(ObjStrs, Obj.Name .. "[" .. Disp .. "]")
-                end
-            end
-
-            print("[Heartbeat] running=" .. tostring(Running)
-                .. " zombies=" .. InFolder
-                .. " section=" .. Section
-                .. " attacks=" .. Stats.AttacksAttempted
-                .. " sinceAttack=" .. SinceAttack .. "s"
-                .. " GF=" .. GF .. " SS=" .. SS .. " CS=" .. CS)
-            print("[Heartbeat] gates(closed=" .. GateClosed .. " open=" .. GateOpen .. ")"
-                .. " objectives=[" .. (#ObjStrs > 0 and table.concat(ObjStrs, ", ") or "none") .. "]")
-
-            if SinceAttack > 120 and Running and (tick() - LastStuckAlarm) > 300 then
-                LastStuckAlarm = tick()
-                SendWebhook("Script Stalled", {
-                    { name = "SinceAttack",  value = SinceAttack .. "s",                    inline = true },
-                    { name = "Zombies",      value = tostring(InFolder),                    inline = true },
-                    { name = "Section",      value = Section,                               inline = true },
-                    { name = "GF/SS/CS",     value = GF .. "/" .. SS .. "/" .. CS,          inline = true },
-                    { name = "Gates",        value = "closed=" .. GateClosed .. " open=" .. GateOpen, inline = true },
-                    { name = "Objectives",   value = #ObjStrs > 0 and table.concat(ObjStrs, "\n") or "(none)", inline = false },
-                    { name = "CurrentTarget",
-                      value = (CurrentTarget and CurrentTarget.Parent) and CurrentTarget.Name or "(none)",
-                      inline = false },
-                }, 15158332)
-            end
-        end)
-    end
-end)
-
-SendWebhook = function(Title, Fields, Color)
-    pcall(function()
-        local Body = HttpService:JSONEncode({
-            username = "StoryFarm",
-            embeds = {{
-                title  = Title,
-                color  = Color or 3066993,
-                fields = Fields,
-            }}
-        })
-        local RequestFunc = (syn and syn.request) or request or http_request
-        RequestFunc({
-            Url     = WEBHOOK,
-            Method  = "POST",
-            Headers = { ["Content-Type"] = "application/json" },
-            Body    = Body,
-        })
-    end)
-end
-
 local function SendError(Label, Err, Trace)
-    local Msg = "[StoryFarm] ERROR in " .. Label .. ": " .. tostring(Err)
-    print(Msg)
+    print("[StoryFarm] ERROR " .. Label .. ": " .. tostring(Err))
     if Trace then print(Trace) end
-    SendWebhook("Error: " .. Label, {
-        { name = "Details", value = "```" .. tostring(Err) .. "```",                              inline = false },
-        { name = "Trace",   value = "```" .. tostring(Trace or "no trace"):sub(1, 1000) .. "```", inline = false },
-    }, 15158332)
+    if SendWebhook then
+        SendWebhook("Error: " .. Label, {
+            { name = "Details", value = "```" .. tostring(Err):sub(1, 800) .. "```", inline = false },
+            { name = "Trace",   value = "```" .. tostring(Trace or "no trace"):sub(1, 800) .. "```", inline = false },
+        }, 15158332)
+    end
 end
 
 local function Safe(Label, Fn, ...)
@@ -254,50 +177,57 @@ local function Safe(Label, Fn, ...)
     end, function(Err)
         return tostring(Err) .. "\n" .. debug.traceback("", 2)
     end)
-    if not ok then SendError(Label, errOrResult, nil) end
+    if not ok then SendError(Label, errOrResult) end
     return ok, errOrResult
 end
 
-local function SafeWrap(Label, Fn)
-    return function(...)
-        local args = { ... }
-        local ok, err = xpcall(function() return Fn(table.unpack(args)) end, function(e)
-            return tostring(e) .. "\n" .. debug.traceback("", 2)
-        end)
-        if not ok then SendError(Label, err, nil) end
-    end
+SendWebhook = function(Title, Fields, Color)
+    pcall(function()
+        local RequestFunc = (syn and syn.request) or request or http_request
+        if not RequestFunc then return end
+        RequestFunc({
+            Url     = WEBHOOK,
+            Method  = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body    = HttpService:JSONEncode({
+                username = "StoryFarm",
+                embeds = {{
+                    title  = Title,
+                    color  = Color or 3066993,
+                    fields = Fields,
+                }},
+            }),
+        })
+    end)
 end
 
 do
     local LastReported = 0
     pcall(function()
         game:GetService("ScriptContext").Error:Connect(function(Msg, Trace)
+            if not Alive() then return end
             if tick() - LastReported < 2 then return end
             LastReported = tick()
             SendError("UncaughtScriptError", Msg, Trace)
         end)
     end)
-    pcall(function()
-        game:GetService("LogService").MessageOut:Connect(function(Msg, Type)
-            if Type == Enum.MessageType.MessageError then
-                if tick() - LastReported < 2 then return end
-                LastReported = tick()
-                SendError("LogServiceError", Msg, nil)
-            end
+end
+
+-- ─── ANTI-AFK + INPUT ────────────────────────────────────────────────────────
+do
+    local VirtualUser = game:GetService("VirtualUser")
+    LocalPlayer.Idled:Connect(function()
+        if not Alive() then return end
+        pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new())
         end)
+        print("[StoryFarm] Anti-AFK fired")
     end)
 end
 
-task.spawn(function()
-    pcall(function()
-        SendWebhook("StoryFarm Started", {
-            { name = "Time",    value = os.date("%Y-%m-%d %H:%M:%S"), inline = true },
-            { name = "PlaceId", value = tostring(game.PlaceId),       inline = true },
-        }, 3447003)
-    end)
-end)
-
 UserInputService.InputBegan:Connect(function(Input, GameProcessed)
+    if not Alive() then return end
     if GameProcessed then return end
     if Input.KeyCode == Enum.KeyCode.PageDown then
         Running = not Running
@@ -305,34 +235,94 @@ UserInputService.InputBegan:Connect(function(Input, GameProcessed)
     end
 end)
 
-local function IsCharValid()
-    return Character and Character.Parent
-        and Humanoid and Humanoid.Parent and Humanoid.Health > 0
-        and HRP and HRP.Parent
-end
+-- ─── REMOTES + DATA ──────────────────────────────────────────────────────────
+local Assets, Remotes, Interact, UsedAbility, DrawCardRemote, FuncInteract
 
-local function IsActionBlocked()
-    if not IsCharValid() then return true end
-    for _, Name in ipairs(BLOCKING_STATES) do
-        if Character:FindFirstChild(Name) then return true end
+local function ResolveRemotes()
+    if not Assets then Assets = ReplicatedStorage:WaitForChild("Assets", 30) end
+    if not Assets then return end
+    if not Remotes then Remotes = Assets:WaitForChild("Remotes", 30) end
+    if not Remotes then return end
+    Interact        = Interact        or Remotes:FindFirstChild("Interact")
+    UsedAbility     = UsedAbility     or Remotes:FindFirstChild("UsedAbility")
+    DrawCardRemote  = DrawCardRemote  or Remotes:FindFirstChild("DrawCard")
+    if not FuncInteract then
+        local Requests = Assets:FindFirstChild("Requests")
+        FuncInteract = Requests and Requests:FindFirstChild("FuncInteract")
     end
-    if workspace:FindFirstChild("Cutscene")    then return true end
-    if workspace:FindFirstChild("GameFinished") then return true end
-    return false
 end
 
-local function GetMatchStats()
-    local MatchConfig  = workspace:FindFirstChild("MatchConfig")
-    if not MatchConfig then return nil end
-    local PlayersStats = MatchConfig:FindFirstChild("PlayersStats")
-    if not PlayersStats then return nil end
-    local ok, Decoded  = pcall(HttpService.JSONDecode, HttpService, PlayersStats.Value)
-    if not ok or type(Decoded) ~= "table" then return nil end
-    return Decoded[LocalPlayer.Name]
+ResolveRemotes()
+
+local function GetInteract()
+    if not Interact then ResolveRemotes() end
+    return Interact
 end
+
+-- ─── ABILITY / GADGET / SPECIAL REFRESH ──────────────────────────────────────
+local function DecodeSlot(StringValue)
+    if not StringValue then return nil end
+    local ok, Decoded = pcall(HttpService.JSONDecode, HttpService, StringValue.Value)
+    if not ok then return nil end
+    return Decoded
+end
+
+local function RefreshAbility()
+    local Data = LocalPlayer:FindFirstChild("Data")
+    if not Data then return end
+    local Decoded = DecodeSlot(Data:FindFirstChild("AbilitySlots"))
+    if not Decoded then return end
+    for SlotKey, Slot in pairs(Decoded) do
+        if Slot and Slot.Showcasing then
+            ShowcasingSlot, ShowcasingAbility = SlotKey, Slot.Name
+            return
+        end
+    end
+end
+
+local function RefreshGadget()
+    local Data = LocalPlayer:FindFirstChild("Data")
+    if not Data then return end
+    local Decoded = DecodeSlot(Data:FindFirstChild("GadgetSlots"))
+    if not Decoded then return end
+    for SlotKey, Slot in pairs(Decoded) do
+        if Slot and Slot.Equipped then
+            GadgetSlotKey, GadgetName = SlotKey, Slot.Name
+            return
+        end
+    end
+end
+
+local function RefreshSpecial()
+    local Data = LocalPlayer:FindFirstChild("Data")
+    if not Data then return end
+    local Decoded = DecodeSlot(Data:FindFirstChild("SpecialSlot"))
+    if not Decoded then return end
+    for SlotKey, Slot in pairs(Decoded) do
+        if Slot and Slot.Equipped then
+            SpecialSlotKey, SpecialName = SlotKey, Slot.Name
+            return
+        end
+    end
+end
+
+RefreshAbility()
+RefreshGadget()
+RefreshSpecial()
+
+task.spawn(function()
+    local Data = LocalPlayer:WaitForChild("Data", 30)
+    if not Data then return end
+    local AS = Data:WaitForChild("AbilitySlots", 30)
+    local GS = Data:WaitForChild("GadgetSlots", 30)
+    local SS = Data:FindFirstChild("SpecialSlot")
+    if AS then AS:GetPropertyChangedSignal("Value"):Connect(RefreshAbility) end
+    if GS then GS:GetPropertyChangedSignal("Value"):Connect(RefreshGadget) end
+    if SS then SS:GetPropertyChangedSignal("Value"):Connect(RefreshSpecial) end
+end)
 
 local function GetData()
-    local Data     = LocalPlayer:FindFirstChild("Data")
+    local Data = LocalPlayer:FindFirstChild("Data")
     if not Data then return nil end
     local Level    = Data:FindFirstChild("BattlepassLevel")
     local Rebirths = Data:FindFirstChild("Rebirths")
@@ -350,396 +340,402 @@ local function CanRebirth()
     return Data.Level >= Step.RequiredLevel and Data.Coins >= Step.CoinsRequired
 end
 
-local function GetInteract()
-    local Assets  = ReplicatedStorage:FindFirstChild("Assets")
-    if not Assets then return nil end
-    local Remotes = Assets:FindFirstChild("Remotes")
-    if not Remotes then return nil end
-    return Remotes:FindFirstChild("Interact")
-end
-
-local function GetAbilityInfo()
-    local Data = LocalPlayer:FindFirstChild("Data")
-    if not Data then return nil, nil end
-    local AbilitySlots = Data:FindFirstChild("AbilitySlots")
-    if not AbilitySlots then return nil, nil end
-    local ok, Decoded = pcall(HttpService.JSONDecode, HttpService, AbilitySlots.Value)
-    if not ok or not Decoded then return nil, nil end
-    for SlotName, SlotData in pairs(Decoded) do
-        if SlotData and SlotData.Showcasing then
-            return SlotName, SlotData.Name
+-- ─── COOLDOWN HOOK ───────────────────────────────────────────────────────────
+task.spawn(function()
+    Safe("CooldownHook", function()
+        local UA
+        for _ = 1, 30 do
+            ResolveRemotes()
+            UA = UsedAbility
+            if UA then break end
+            task.wait(1)
         end
-    end
-    return nil, nil
-end
+        if not UA then print("[StoryFarm] UsedAbility never appeared"); return end
 
--- Root-part resolver
-local function ResolveRoot(Model)
-    return Model:FindFirstChild("HumanoidRootPart")
-        or Model.PrimaryPart
-        or Model:FindFirstChild("Torso")
-        or Model:FindFirstChild("UpperTorso")
-        or Model:FindFirstChild("Head")
-        or Model:FindFirstChildWhichIsA("BasePart")
-end
+        UA.OnClientEvent:Connect(function(_, Duration, _AbilityName, KeyIndex)
+            if not Alive() then return end
+            if type(Duration) ~= "number" then return end
+            if type(KeyIndex) == "number" and KeyIndex >= 1 and KeyIndex <= SLOT_COUNT then
+                SlotCooldownEnd[KeyIndex] = tick() + Duration
+            elseif KeyIndex == "Special" or KeyIndex == "Q" then
+                SpecialCooldownEnd = tick() + Duration
+            end
+        end)
+        print("[StoryFarm] Cooldown hook armed")
+    end)
+end)
 
--- Health resolver (returns the object, not the value)
-local function ResolveHealth(Model)
+-- ─── ZOMBIE PICKING ──────────────────────────────────────────────────────────
+local function GetHP(Model)
     local Config = Model:FindFirstChild("Config")
     if Config then
         local H = Config:FindFirstChild("Health")
-        if H and (H:IsA("IntValue") or H:IsA("NumberValue")) then return H end
-    end
-    local Direct = Model:FindFirstChild("Health")
-    if Direct and (Direct:IsA("IntValue") or Direct:IsA("NumberValue")) then return Direct end
-    for _, Child in ipairs(Model:GetDescendants()) do
-        if (Child:IsA("IntValue") or Child:IsA("NumberValue")) and Child.Name == "Health" then
-            return Child
-        end
+        if H and (H:IsA("IntValue") or H:IsA("NumberValue")) then return H.Value end
     end
     local Hum = Model:FindFirstChildOfClass("Humanoid")
-    if Hum then return Hum end
+    if Hum then return Hum.Health end
     return nil
 end
 
--- Read current HP value (handles both inverted zombie health and Humanoid)
-local function GetHP(Model)
-    local H = ResolveHealth(Model)
-    if not H then return nil end
-    if H:IsA("Humanoid") then return H.Health end
-    return H.Value
-end
-
--- ─── ZOMBIE TARGETING ───────────────────────────────────────────────────────
--- No cache. Every pick directly reads workspace.Zombies descendants.
--- If a model has been on the SkipUntil list and time expired, it gets retried
--- automatically next pick cycle.
-
-local function GetLiveZombies()
-    local Folder = workspace:FindFirstChild("Zombies")
-    if not Folder then return {} end
-    return Folder:GetDescendants()
+local function IsAlive(Model)
+    if not Model or not Model.Parent then return false end
+    if Model:GetAttribute("Died") then return false end
+    local HP = GetHP(Model)
+    return HP ~= nil and HP > 0
 end
 
 local function PickTarget()
     if not IsCharValid() then return nil end
+    local ZF = workspace:FindFirstChild("Zombies")
+    if not ZF then return nil end
+
     local Now = tick()
     local Best, BestDist = nil, math.huge
+    local MyPos = HRP.Position
 
-    for _, Model in ipairs(GetLiveZombies()) do
+    for _, Model in ipairs(ZF:GetChildren()) do
         if not Model:IsA("Model") then continue end
         if SkipUntil[Model] and SkipUntil[Model] > Now then continue end
-        local Root = ResolveRoot(Model)
+        if not IsAlive(Model) then continue end
+        local Root = Model:FindFirstChild("HumanoidRootPart")
         if not Root then continue end
-        local Dist = (Root.Position - HRP.Position).Magnitude
+        local Dist = (Root.Position - MyPos).Magnitude
         if Dist < BestDist then
-            Best     = Model
-            BestDist = Dist
+            Best, BestDist = Model, Dist
         end
     end
-
     return Best
 end
 
--- ─── MOVEMENT ───────────────────────────────────────────────────────────────
-
-local function GoUnderground()
-    if not IsCharValid() then return end
-    HRP.CFrame = CFrame.new(HRP.Position.X, HRP.Position.Y - UNDERGROUND_Y, HRP.Position.Z)
-    HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+-- ─── ACTION CHECK (mirrors game's Utils.ActionCheck) ─────────────────────────
+local function IsActionBlocked()
+    if not IsCharValid() then return true end
+    for _, Name in ipairs(BLOCKING_STATES) do
+        if Character:FindFirstChild(Name) then return true end
+    end
+    if workspace:FindFirstChild("Cutscene")         then return true end
+    if workspace:FindFirstChild("GameFinished")     then return true end
+    if workspace:FindFirstChild("SwitchingSection") then return true end
+    return false
 end
 
-local UnderRaycastParams = RaycastParams.new()
-UnderRaycastParams.FilterType = Enum.RaycastFilterType.Exclude
-
-local function RefreshRaycastFilter()
-    local Filter = {}
-    if Character then table.insert(Filter, Character) end
-    for _, Name in ipairs({ "Alive", "Zombies", "Thrown", "Pets", "PET_ANCHORS" }) do
-        local F = workspace:FindFirstChild(Name)
-        if F then table.insert(Filter, F) end
-    end
-    UnderRaycastParams.FilterDescendantsInstances = Filter
-end
-
--- Go underground beneath the lowest zombie currently visible in workspace.Zombies
-local function GoUnderZombie()
-    if not IsCharValid() then return false end
-
-    local BestRoot, BestY = nil, math.huge
-    for _, Model in ipairs(GetLiveZombies()) do
-        if not Model:IsA("Model") then continue end
-        local Root = ResolveRoot(Model)
-        if Root and Root.Position.Y < BestY then
-            BestRoot = Root
-            BestY    = Root.Position.Y
-        end
-    end
-
-    if not BestRoot then
-        GoUnderground()
-        return false
-    end
-
-    local Pos = BestRoot.Position
-    RefreshRaycastFilter()
-    local Hit    = workspace:Raycast(Pos + Vector3.new(0, 50, 0), Vector3.new(0, -2000, 0), UnderRaycastParams)
-    local TargetY = Hit and (Hit.Position.Y - UNDERGROUND_Y) or (Pos.Y - UNDERGROUND_Y)
-
-    HRP.CFrame = CFrame.new(Pos.X, TargetY, Pos.Z)
-    HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-    return true
-end
-
--- Noclip
+-- ─── NOCLIP ──────────────────────────────────────────────────────────────────
 RunService.Stepped:Connect(function()
     if not Alive() then return end
     if not Running then return end
     if not Character or not Character.Parent then return end
-    Safe("Noclip", function()
+    pcall(function()
         for _, Part in ipairs(Character:GetDescendants()) do
             if Part:IsA("BasePart") then Part.CanCollide = false end
         end
     end)
 end)
 
--- Watchdog: if Attacking gets stuck, force-clear it
-task.spawn(function()
-    while true do
-        task.wait(1)
-        if not Alive() then break end
-        if Attacking and (tick() - AttackStartTime) > ATTACK_TIMEOUT then
-            print("[StoryFarm] Stuck for " .. math.floor(tick() - AttackStartTime) .. "s, force release")
-            Attacking = false
-            Safe("WatchdogUnstick", GoUnderground)
-        end
-    end
-end)
-
--- Authoritative per-slot cooldown from server
-task.spawn(function()
-    Safe("CooldownHook", function()
-        local Assets      = ReplicatedStorage:WaitForChild("Assets", 30)
-        local Remotes     = Assets:WaitForChild("Remotes", 30)
-        local UsedAbility = Remotes:WaitForChild("UsedAbility", 30)
-
-        UsedAbility.OnClientEvent:Connect(function(_, Duration, _AbilityName, KeyIndex)
-            if type(Duration) ~= "number" then return end
-            if type(KeyIndex) ~= "number" or KeyIndex < 1 or KeyIndex > 4 then return end
-            SlotCooldownEnd[KeyIndex] = tick() + Duration
-        end)
-
-        print("[StoryFarm] Cooldown hook armed")
-    end)
-end)
-
-local function PickReadySlot()
-    local Now = tick()
-    for i = 1, 3 do
-        if SlotCooldownEnd[i] <= Now then return i end
-    end
-    return nil
-end
-
-local function AnySlotReady()
-    local Now = tick()
-    for i = 1, 3 do
-        if SlotCooldownEnd[i] <= Now then return true end
-    end
-    return false
-end
-
--- Pick the position inside AOE_RADIUS that covers the most zombies
-local function PickAttackCenter(Target)
-    local Root = ResolveRoot(Target)
-    if not Root then return nil, 0 end
-
-    local Best      = Root.Position
-    local BestCount = 1
-    local Search    = (AOE_RADIUS * 2) * (AOE_RADIUS * 2)
-    local Radius2   = AOE_RADIUS * AOE_RADIUS
-    local Models    = GetLiveZombies()
-
-    local Candidates = { Best }
-    for _, Model in ipairs(Models) do
-        if not Model:IsA("Model") then continue end
-        local R = ResolveRoot(Model)
-        if not R then continue end
-        local Pos = R.Position
-        local dx, dz = Pos.X - Best.X, Pos.Z - Best.Z
-        if dx * dx + dz * dz < Search then
-            table.insert(Candidates, Pos)
-        end
-    end
-
-    for _, Center in ipairs(Candidates) do
-        local Count = 0
-        for _, Model in ipairs(Models) do
-            if not Model:IsA("Model") then continue end
-            local R = ResolveRoot(Model)
-            if not R then continue end
-            local Pos = R.Position
-            local dx, dz = Pos.X - Center.X, Pos.Z - Center.Z
-            if dx * dx + dz * dz <= Radius2 then Count += 1 end
-        end
-        if Count > BestCount then
-            BestCount = Count
-            Best      = Center
-        end
-    end
-
-    return Best, BestCount
-end
-
--- ─── MAIN ATTACK LOOP ───────────────────────────────────────────────────────
-
+-- ─── ATTACK LOOP ─────────────────────────────────────────────────────────────
+-- Infinity-style: TP onto target, fire M1 + ability + gadget + special continuously.
+-- No underground dance. Lost throughput >> lost HP.
 task.spawn(function()
     while true do
         task.wait(0.05)
         if not Alive() then break end
         if not Running then continue end
-        if Attacking then continue end
         if not IsCharValid() then task.wait(0.5) continue end
 
         Safe("AttackLoop", function()
-            if workspace:FindFirstChild("GameFinished")
-                or workspace:FindFirstChild("Cutscene")
-                or workspace:FindFirstChild("SwitchingSection") then
-                GoUnderZombie()
-                task.wait(1)
-                return
-            end
+            if IsActionBlocked() then return end
 
-            local Interact = GetInteract()
-            if not Interact then return end
+            local Inter = GetInteract()
+            if not Inter then return end
 
-            local SlotName, AbilityName = GetAbilityInfo()
-            if not SlotName or not AbilityName then task.wait(0.5) return end
-
-            if IsActionBlocked() then GoUnderZombie() task.wait(0.1) return end
-            if not AnySlotReady() then GoUnderZombie() task.wait(0.1) return end
-            if tick() - LastDamageAt < POST_DAMAGE_LOCKOUT then GoUnderZombie() task.wait(0.1) return end
+            if not ShowcasingAbility then RefreshAbility() end
+            if not ShowcasingAbility then return end
 
             local Target = PickTarget()
             if not Target then
-                local IdleFor = tick() - LastAttackAt
-                if IdleFor > 5 then
-                    local MapSpawn  = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("Spawns")
-                    local SpawnPart = MapSpawn and MapSpawn:FindFirstChildOfClass("Part")
-                    if SpawnPart then
-                        HRP.CFrame = SpawnPart.CFrame + Vector3.new(0, 5, 0)
-                    else
-                        HRP.CFrame = CFrame.new(HRP.Position.X, 10, HRP.Position.Z)
-                    end
-                    HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-                    task.wait(1)
-                else
-                    GoUnderZombie()
-                    task.wait(0.3)
-                end
                 CurrentTarget          = nil
                 ActiveTargetHPBaseline = nil
                 ActiveTargetBaselineAt = nil
                 return
             end
 
-            -- Reset HP baseline when we switch targets
+            local Root = Target:FindFirstChild("HumanoidRootPart")
+            if not Root then return end
+
+            -- HP baseline for no-damage skip
             if Target ~= CurrentTarget then
                 CurrentTarget          = Target
                 ActiveTargetHPBaseline = GetHP(Target)
                 ActiveTargetBaselineAt = tick()
-            end
-
-            Attacking       = true
-            AttackStartTime = tick()
-            Stats.AttacksAttempted += 1
-
-            local Root = ResolveRoot(Target)
-            if not Root or not Root.Parent then
-                Stats.AttacksAborted += 1
-                Attacking = false
-                return
-            end
-
-            local Center, Hits = PickAttackCenter(Target)
-            if not Center then
-                Stats.AttacksAborted += 1
-                GoUnderground()
-                CurrentTarget          = nil
-                ActiveTargetHPBaseline = nil
-                ActiveTargetBaselineAt = nil
-                Attacking = false
-                return
-            end
-
-            HRP.CFrame = CFrame.new(Center.X, Center.Y, Center.Z)
-            HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-            task.wait(0.03)
-
-            local HPBefore  = Humanoid and Humanoid.Health or 0
-            local MaxHP     = (Humanoid and Humanoid.MaxHealth and Humanoid.MaxHealth > 0) and Humanoid.MaxHealth or 100
-            local DamageCap = MaxHP * DAMAGE_ABORT_THRESHOLD
-            local GraceEnd  = tick() + DAMAGE_GRACE_PERIOD
-
-            local Deadline = tick() + ATTACK_WINDOW
-            local Fired    = 0
-            while tick() < Deadline do
-                if not IsCharValid() then break end
-                if not Target.Parent then break end
-
-                if tick() > GraceEnd then
-                    if Humanoid and (HPBefore - Humanoid.Health) >= DamageCap then
-                        LastDamageAt = tick()
-                        break
-                    end
+            else
+                local Now = GetHP(Target)
+                if Now ~= nil and Now ~= ActiveTargetHPBaseline then
+                    ActiveTargetHPBaseline = Now
+                    ActiveTargetBaselineAt = tick()
+                elseif ActiveTargetBaselineAt and tick() - ActiveTargetBaselineAt >= NO_DAMAGE_TIMEOUT then
+                    SkipUntil[Target] = tick() + SKIP_DURATION
+                    print("[StoryFarm] No damage on " .. Target.Name
+                        .. " for " .. NO_DAMAGE_TIMEOUT .. "s — skipping " .. SKIP_DURATION .. "s")
+                    CurrentTarget = nil
+                    return
                 end
+            end
 
-                if IsActionBlocked() then task.wait(0.03) continue end
+            -- TP onto target if too far
+            if (HRP.Position - Root.Position).Magnitude > TP_RANGE_MAX then
+                HRP.CFrame = CFrame.new(Root.Position)
+                HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                task.wait(0.05)
+                if not IsCharValid() then return end
+            end
 
-                local Slot = PickReadySlot()
-                if not Slot then break end
+            local Now = tick()
 
-                Interact:FireServer("Ability", Slot, SlotName, AbilityName, "Began")
+            -- M1 — basic attack, ~0.4s server CD per decompile
+            if Now - LastM1 >= M1_CD then
+                Inter:FireServer("M1", ShowcasingAbility, workspace:GetServerTimeNow())
+                LastM1 = Now
+                Stats.M1 += 1
+                LastAttackAt = Now
+            end
+
+            -- Ability rotation — pick the first off-CD slot of 1..5 each tick
+            for i = 1, SLOT_COUNT do
+                if SlotCooldownEnd[i] <= Now then
+                    Inter:FireServer("Ability", i, ShowcasingSlot, ShowcasingAbility, "Began")
+                    task.wait(0.03)
+                    Inter:FireServer("Ability", i, ShowcasingSlot, ShowcasingAbility, "Released")
+                    if SlotCooldownEnd[i] <= tick() then
+                        SlotCooldownEnd[i] = tick() + SLOT_SOFT_CD
+                    end
+                    Stats.AbilitiesFired += 1
+                    LastAttackAt = tick()
+                    break -- one per tick keeps M1 tight
+                end
+            end
+
+            -- Gadget (E)
+            if tick() >= GadgetCooldownEnd and GadgetSlotKey and GadgetName then
+                Inter:FireServer("Gadget", GadgetSlotKey, GadgetName, "Began")
                 task.wait(0.03)
-                Interact:FireServer("Ability", Slot, SlotName, AbilityName, "Released")
+                Inter:FireServer("Gadget", GadgetSlotKey, GadgetName, "Released")
+                GadgetCooldownEnd = tick() + GADGET_CD
+                Stats.GadgetsFired += 1
                 LastAttackAt = tick()
-
-                if SlotCooldownEnd[Slot] <= tick() then
-                    SlotCooldownEnd[Slot] = tick() + 0.4
-                end
-                Fired += 1
-                task.wait(0.08)
             end
 
-            -- No-damage skip: if HP hasn't budged since we first locked onto this model, skip it
-            if Fired > 0 and ActiveTargetBaselineAt and ActiveTargetHPBaseline ~= nil then
-                local NowHP = GetHP(Target)
-                if NowHP ~= nil then
-                    if NowHP ~= ActiveTargetHPBaseline then
-                        -- Damage registered — update baseline, reset timer
-                        ActiveTargetHPBaseline = NowHP
-                        ActiveTargetBaselineAt = tick()
-                    elseif tick() - ActiveTargetBaselineAt >= NO_DAMAGE_TIMEOUT then
-                        -- 10s with zero HP movement → skip for SKIP_DURATION
-                        SkipUntil[Target] = tick() + SKIP_DURATION
-                        print("[StoryFarm] No damage on " .. Target.Name
-                            .. " for " .. NO_DAMAGE_TIMEOUT .. "s — skipping for " .. SKIP_DURATION .. "s")
-                        CurrentTarget          = nil
-                        ActiveTargetHPBaseline = nil
-                        ActiveTargetBaselineAt = nil
-                    end
-                end
+            -- Special (Q)
+            if tick() >= SpecialCooldownEnd and SpecialSlotKey and SpecialName then
+                Inter:FireServer("Special", SpecialSlotKey, SpecialName, "Began")
+                task.wait(0.03)
+                Inter:FireServer("Special", SpecialSlotKey, SpecialName, "Released")
+                SpecialCooldownEnd = tick() + SPECIAL_SOFT_CD
+                Stats.SpecialsFired += 1
+                LastAttackAt = tick()
             end
-
-            GoUnderZombie()
-            task.wait(0.05)
-            Attacking = false
         end)
     end
 end)
 
--- ─── AUTO REBIRTH ────────────────────────────────────────────────────────────
+-- ─── CARD PICKER ─────────────────────────────────────────────────────────────
+-- Story mode drops cards between sections. Pick by priority then click via
+-- FuncInteract:InvokeServer("DrawCard", CardName) — matches CardsPanel.lua:100
+local CardPicking = false
 
+local function PickFromCards(Cards)
+    if CardPicking or not Cards or #Cards == 0 then return end
+    if not FuncInteract then return end
+    CardPicking = true
+    task.spawn(function()
+        task.wait(0.5)
+        local Offered = {}
+        for _, C in ipairs(Cards) do
+            if C.CardName then Offered[C.CardName] = true end
+        end
+        local Pick
+        for _, Want in ipairs(CARD_PRIORITY) do
+            if Offered[Want] then Pick = Want break end
+        end
+        if not Pick then Pick = Cards[1].CardName end
+        print("[StoryFarm] Picking card: " .. tostring(Pick))
+        pcall(function() FuncInteract:InvokeServer("DrawCard", Pick) end)
+        Stats.Cards += 1
+        task.wait(5)
+        CardPicking = false
+    end)
+end
+
+task.spawn(function()
+    Safe("CardRemoteHook", function()
+        for _ = 1, 30 do
+            ResolveRemotes()
+            if DrawCardRemote then break end
+            task.wait(1)
+        end
+        if not DrawCardRemote then return end
+        DrawCardRemote.OnClientEvent:Connect(function(Action, Cards)
+            if not Alive() then return end
+            if Action == "Draw" then PickFromCards(Cards) end
+        end)
+        print("[StoryFarm] Card remote hook armed")
+    end)
+end)
+
+-- UI poller fallback: read CardsFrame.Container children directly
+task.spawn(function()
+    local ok, Container = pcall(function()
+        return LocalPlayer.PlayerGui:WaitForChild("HUD", 30)
+            :WaitForChild("Main", 10)
+            :WaitForChild("Cards", 10)
+            :WaitForChild("CardsFrame", 10)
+            :WaitForChild("Container", 10)
+    end)
+    if not ok or not Container then return end
+    while true do
+        task.wait(0.3)
+        if not Alive() then break end
+        if not Running then continue end
+        local Btns = {}
+        for _, C in ipairs(Container:GetChildren()) do
+            if C:IsA("GuiObject") and C:GetAttribute("CardName") then
+                table.insert(Btns, { CardName = C:GetAttribute("CardName") })
+            end
+        end
+        if #Btns > 0 then PickFromCards(Btns) end
+    end
+end)
+
+-- ─── GATE OPENER ─────────────────────────────────────────────────────────────
+-- _LocalFX.lua:17418 — SetupGate connects Touched → fires GateHit. We have noclip
+-- so Touched might not fire reliably; bypass by firing GateHit directly when
+-- zombies are cleared and un-opened gates exist.
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if not Alive() then break end
+        if not Running then continue end
+        if not IsCharValid() then continue end
+        if workspace:FindFirstChild("GameFinished")     then continue end
+        if workspace:FindFirstChild("Cutscene")         then continue end
+        if workspace:FindFirstChild("SwitchingSection") then continue end
+
+        -- Only when there are no live zombies in the area
+        local ZF = workspace:FindFirstChild("Zombies")
+        local LiveCount = 0
+        if ZF then
+            for _, M in ipairs(ZF:GetChildren()) do
+                if IsAlive(M) then LiveCount += 1 end
+            end
+        end
+        if LiveCount > 0 then continue end
+        if tick() - LastAttackAt < IDLE_GATE_THRESHOLD then continue end
+
+        Safe("GateOpener", function()
+            local Inter = GetInteract()
+            if not Inter then return end
+            local Gates = CollectionService:GetTagged("GateHitbox")
+            if #Gates == 0 then return end
+
+            for _, Gate in ipairs(Gates) do
+                if not Gate or not Gate.Parent then continue end
+                if Gate.Parent:GetAttribute("Opened") then continue end
+
+                local GatePart = Gate:IsA("BasePart") and Gate
+                    or Gate:FindFirstChildWhichIsA("BasePart")
+                if GatePart and IsCharValid() then
+                    HRP.CFrame = CFrame.new(GatePart.Position + Vector3.new(0, 3, 0))
+                    HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                    task.wait(0.3)
+                end
+                Inter:FireServer("GateHit", Gate.Parent)
+                Stats.GatesFired += 1
+                print("[StoryFarm] GateHit → " .. Gate.Parent.Name)
+            end
+        end)
+    end
+end)
+
+-- ─── AUTO REVIVE ─────────────────────────────────────────────────────────────
+local LastReviveAt = 0
+local function FireRevive(Source)
+    if tick() - LastReviveAt < 2 then return end
+    LastReviveAt = tick()
+    Safe("Revive_" .. Source, function()
+        local Inter = GetInteract()
+        if not Inter then return end
+        print("[StoryFarm] [" .. Source .. "] CanRevive → firing Revive")
+        Inter:FireServer("Revive")
+        Stats.Revives += 1
+    end)
+end
+
+local ReviveConn = nil
+local function HookRevive(Char)
+    if ReviveConn then pcall(function() ReviveConn:Disconnect() end) end
+    if not Char then return end
+    local function Try()
+        if not Alive() then return end
+        if not Running then return end
+        if not Char.Parent then return end
+        if Char:GetAttribute("CanRevive") then FireRevive("signal") end
+    end
+    ReviveConn = Char:GetAttributeChangedSignal("CanRevive"):Connect(Try)
+    Try()
+end
+
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if not Alive() then break end
+        if not Running then continue end
+        local Char = LocalPlayer.Character
+        if not Char then continue end
+        if not Char:GetAttribute("CanRevive") then continue end
+        FireRevive("poll")
+    end
+end)
+
+-- ─── MATCH END / PLAY AGAIN ──────────────────────────────────────────────────
+local LastEndAt = 0
+local function HandleMatchEnd()
+    if tick() - LastEndAt < 5 then return end
+    LastEndAt = tick()
+
+    Safe("MatchEnd", function()
+        Stats.MatchesCompleted += 1
+        local Data = GetData()
+        SendWebhook("Match Over", {
+            { name = "Match #",  value = tostring(Stats.MatchesCompleted),       inline = true },
+            { name = "Coins",    value = Data and tostring(Data.Coins)    or "?", inline = true },
+            { name = "Level",    value = Data and tostring(Data.Level)    or "?", inline = true },
+            { name = "Rebirths", value = Data and tostring(Data.Rebirths) or "?", inline = true },
+            { name = "M1",       value = tostring(Stats.M1),              inline = true },
+            { name = "Abilities", value = tostring(Stats.AbilitiesFired), inline = true },
+            { name = "Gates",     value = tostring(Stats.GatesFired),     inline = true },
+        }, 3066993)
+
+        if not Running then return end
+        local Deadline = tick() + 20
+        while tick() < Deadline do
+            if not Alive() then break end
+            if not workspace:FindFirstChild("GameFinished") then break end
+            local Inter = GetInteract()
+            if Inter then Safe("PlayAgain", function() Inter:FireServer("PlayAgain") end) end
+            task.wait(1)
+        end
+    end)
+end
+
+task.spawn(function()
+    Safe("EndWatcher", function()
+        if workspace:FindFirstChild("GameFinished") then HandleMatchEnd() end
+        workspace.ChildAdded:Connect(function(Child)
+            if not Alive() then return end
+            if Child.Name == "GameFinished" then HandleMatchEnd() end
+        end)
+    end)
+end)
+
+-- ─── AUTO REBIRTH ────────────────────────────────────────────────────────────
 task.spawn(function()
     while true do
         task.wait(10)
@@ -748,16 +744,14 @@ task.spawn(function()
 
         Safe("AutoRebirth", function()
             if not CanRebirth() then return end
-            local Data    = GetData()
+            local Data = GetData()
             if not Data then return end
-            local Interact = GetInteract()
-            if not Interact then return end
-
-            print("[StoryFarm] Rebirthing! Rebirths: " .. Data.Rebirths .. " Level: " .. Data.Level)
-            Interact:FireServer("Rebirth")
+            local Inter = GetInteract()
+            if not Inter then return end
+            print("[StoryFarm] Rebirthing! Rebirths=" .. Data.Rebirths .. " Level=" .. Data.Level)
+            Inter:FireServer("Rebirth")
             Stats.Rebirths += 1
-
-            SendWebhook("Rebirth Performed!", {
+            SendWebhook("Rebirth Performed", {
                 { name = "Rebirths", value = tostring(Data.Rebirths + 1), inline = true },
                 { name = "Level",    value = tostring(Data.Level),        inline = true },
                 { name = "Coins",    value = tostring(Data.Coins),        inline = true },
@@ -766,308 +760,174 @@ task.spawn(function()
     end
 end)
 
--- ─── END-OF-MATCH ────────────────────────────────────────────────────────────
-
-local LastEndAt = 0
-local function HandleMatchEnd()
-    if tick() - LastEndAt < 5 then return end
-    LastEndAt = tick()
-
-    Safe("EndScreenFired", function()
-        local Data  = GetData()
-        local Match = GetMatchStats()
-        Stats.MatchesCompleted += 1
-
-        local MatchKills  = (Match and type(Match.Kills)       == "number") and Match.Kills       or 0
-        local MatchDamage = (Match and type(Match.DamageDealt) == "number") and Match.DamageDealt or 0
-        Stats.TotalKills  = Stats.TotalKills  + MatchKills
-        Stats.TotalDamage = Stats.TotalDamage + MatchDamage
-
-        SendWebhook("Match Over", {
-            { name = "Coins",       value = Data and tostring(Data.Coins)    or "?", inline = true },
-            { name = "Level",       value = Data and tostring(Data.Level)    or "?", inline = true },
-            { name = "Rebirths",    value = Data and tostring(Data.Rebirths) or "?", inline = true },
-            { name = "Match Kills", value = tostring(MatchKills),                    inline = true },
-            { name = "Match Dmg",   value = tostring(MatchDamage),                   inline = true },
-            { name = "Total Kills", value = tostring(Stats.TotalKills),              inline = true },
-        }, 3066993)
-
-        if not Running then return end
-
-        local Deadline = tick() + 20
-        while tick() < Deadline do
-            if not workspace:FindFirstChild("GameFinished") then break end
-            local Interact = GetInteract()
-            if Interact then
-                Safe("FirePlayAgain", function() Interact:FireServer("PlayAgain") end)
-            end
-            task.wait(1)
-        end
-    end)
-end
-
-task.spawn(function()
-    Safe("EndScreenWatcher", function()
-        if workspace:FindFirstChild("GameFinished") then HandleMatchEnd() end
-        workspace.ChildAdded:Connect(function(Child)
-            if Child.Name == "GameFinished" then HandleMatchEnd() end
-        end)
-        print("[StoryFarm] Watching workspace.GameFinished...")
-    end)
-end)
-
-
--- ─── GATE OPENER ─────────────────────────────────────────────────────────────
--- Decompile shows section advance is NOT a ProximityPrompt.
--- Parts tagged "GateHitbox" (CollectionService) trigger Interact:FireServer("GateHit", gate.Parent)
--- when touched. We're underground when sections clear so we never touch them.
--- Fix: when zombies=0 and un-opened gates exist, TP to them and fire GateHit directly.
-
-task.spawn(function()
-    while true do
-        task.wait(1)
-        if not Alive() then break end
-        if not Running then continue end
-        if not IsCharValid() then continue end
-        if workspace:FindFirstChild("GameFinished") then continue end
-        if workspace:FindFirstChild("Cutscene") then continue end
-        if workspace:FindFirstChild("SwitchingSection") then continue end
-
-        local Folder     = workspace:FindFirstChild("Zombies")
-        local ZombieCount = Folder and #Folder:GetDescendants() or 0
-        if ZombieCount > 0 then continue end
-
-        Safe("GateOpener", function()
-            local Interact = GetInteract()
-            if not Interact then return end
-
-            local Gates = CollectionService:GetTagged("GateHitbox")
-            print("[GateOpener] " .. #Gates .. " GateHitbox parts found")
-
-            for _, Gate in ipairs(Gates) do
-                if not Gate or not Gate.Parent then continue end
-
-                local AlreadyOpen = Gate.Parent:GetAttribute("Opened")
-                print("[GateOpener] gate=" .. Gate.Parent.Name
-                    .. " opened=" .. tostring(AlreadyOpen))
-
-                -- TP directly onto the gate part and wait for position to replicate
-                local GatePart = Gate:IsA("BasePart") and Gate
-                    or Gate:FindFirstChildWhichIsA("BasePart")
-                if GatePart and IsCharValid() then
-                    HRP.CFrame = CFrame.new(GatePart.Position + Vector3.new(0, 3, 0))
-                    HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-                    task.wait(0.3) -- wait for server to see our new position
-                end
-
-                Interact:FireServer("GateHit", Gate.Parent)
-                print("[GateOpener] Fired GateHit → " .. Gate.Parent.Name)
-            end
-        end)
-    end
-end)
-
--- ─── AUTO REVIVE ─────────────────────────────────────────────────────────────
-
-local ReviveAttrConn = nil
-local function HookReviveListener(Char)
-    if ReviveAttrConn then
-        pcall(function() ReviveAttrConn:Disconnect() end)
-        ReviveAttrConn = nil
-    end
-    if not Char then return end
-
-    local function TryRevive()
-        if not Running then return end
-        if not Char or not Char.Parent then return end
-        if not Char:GetAttribute("CanRevive") then return end
-        Safe("AutoRevive", function()
-            local Interact = GetInteract()
-            if not Interact then return end
-            print("[StoryFarm] CanRevive=true, firing Revive")
-            Interact:FireServer("Revive")
-        end)
-    end
-
-    ReviveAttrConn = Char:GetAttributeChangedSignal("CanRevive"):Connect(TryRevive)
-    TryRevive()
-end
-
 -- ─── AUTO START RAID ─────────────────────────────────────────────────────────
-
 task.spawn(function()
     Safe("StartWatcher", function()
         local function FireStart()
+            if not Alive() then return end
             if not Running then return end
             if not workspace:GetAttribute("RaidStarting") then return end
-            Safe("FireVoteSkipRaid", function()
-                local Interact = GetInteract()
-                if not Interact then return end
-                task.wait(0.5)
-                Interact:FireServer("VoteSkipRaid")
-            end)
+            local Inter = GetInteract()
+            if not Inter then return end
+            task.wait(0.5)
+            Safe("VoteSkipRaid", function() Inter:FireServer("VoteSkipRaid") end)
         end
         workspace:GetAttributeChangedSignal("RaidStarting"):Connect(FireStart)
         task.wait(0.5)
         FireStart()
-        print("[StoryFarm] Watching for RaidStarting...")
+        print("[StoryFarm] Raid-start watcher armed")
     end)
 end)
 
--- ─── PERIODIC STATS ──────────────────────────────────────────────────────────
+-- ─── HEARTBEAT ───────────────────────────────────────────────────────────────
+task.spawn(function()
+    while true do
+        task.wait(HEARTBEAT_INTERVAL)
+        if not Alive() then break end
+        pcall(function()
+            local ZF = workspace:FindFirstChild("Zombies")
+            local Total, Live = 0, 0
+            if ZF then
+                for _, M in ipairs(ZF:GetChildren()) do
+                    if M:IsA("Model") then
+                        Total += 1
+                        if IsAlive(M) then Live += 1 end
+                    end
+                end
+            end
 
+            local Section = "?"
+            local MC = workspace:FindFirstChild("MatchConfig")
+            if MC then
+                local CS = MC:FindFirstChild("CurrentSection")
+                if CS then Section = tostring(CS.Value) end
+            end
+
+            local Gates = CollectionService:GetTagged("GateHitbox")
+            local GateOpen, GateClosed = 0, 0
+            for _, G in ipairs(Gates) do
+                if G and G.Parent then
+                    if G.Parent:GetAttribute("Opened") then GateOpen += 1
+                    else GateClosed += 1 end
+                end
+            end
+
+            local ObjStrs = {}
+            local OF = workspace:FindFirstChild("Objectives")
+            if OF then
+                for _, O in ipairs(OF:GetChildren()) do
+                    if O.Name ~= "Template" and O.Name ~= "Title" then
+                        local M = O:GetAttribute("MaxValue")
+                        local V = (pcall(function() return O.Value end) and O.Value) or "?"
+                        table.insert(ObjStrs, O.Name .. "[" .. tostring(V) .. (M and ("/" .. M) or "") .. "]")
+                    end
+                end
+            end
+
+            local SinceAttack = math.floor(tick() - LastAttackAt)
+            print("[Heartbeat] live=" .. Live .. "/" .. Total
+                .. " section=" .. Section
+                .. " M1=" .. Stats.M1
+                .. " ab=" .. Stats.AbilitiesFired
+                .. " gad=" .. Stats.GadgetsFired
+                .. " spec=" .. Stats.SpecialsFired
+                .. " gates=" .. Stats.GatesFired
+                .. " idle=" .. SinceAttack .. "s")
+            print("[Heartbeat] gates(closed=" .. GateClosed .. " open=" .. GateOpen .. ")"
+                .. " objectives=[" .. (#ObjStrs > 0 and table.concat(ObjStrs, ", ") or "none") .. "]")
+        end)
+    end
+end)
+
+-- ─── STATS ───────────────────────────────────────────────────────────────────
 task.spawn(function()
     while true do
         task.wait(STATS_INTERVAL)
         if not Alive() then break end
         if not Running then continue end
-
         Safe("StatsReport", function()
-            local Data      = GetData()
-            local Runtime   = math.floor((tick() - Stats.StartTime) / 60)
-            local LiveMatch = GetMatchStats()
-            local LiveKills = (LiveMatch and type(LiveMatch.Kills) == "number") and LiveMatch.Kills or 0
-
+            local Data = GetData()
+            local Runtime = math.floor((tick() - Stats.StartTime) / 60)
             SendWebhook("Status Report", {
-                { name = "Runtime",       value = Runtime .. " min",                  inline = true },
-                { name = "Matches",       value = tostring(Stats.MatchesCompleted),   inline = true },
-                { name = "Rebirths Done", value = tostring(Stats.Rebirths),           inline = true },
-                { name = "Total Kills",   value = tostring(Stats.TotalKills + LiveKills), inline = true },
-                { name = "Total Damage",  value = tostring(Stats.TotalDamage),        inline = true },
-                { name = "Attacks",       value = tostring(Stats.AttacksAttempted),   inline = true },
-                { name = "Aborted",       value = tostring(Stats.AttacksAborted),     inline = true },
-                { name = "Coins",         value = Data and tostring(Data.Coins)    or "?", inline = true },
-                { name = "Level",         value = Data and tostring(Data.Level)    or "?", inline = true },
-                { name = "Rebirth",       value = Data and tostring(Data.Rebirths) or "?", inline = true },
+                { name = "Runtime",  value = Runtime .. " min",                 inline = true },
+                { name = "Matches",  value = tostring(Stats.MatchesCompleted),  inline = true },
+                { name = "Rebirths", value = tostring(Stats.Rebirths),          inline = true },
+                { name = "M1",       value = tostring(Stats.M1),                inline = true },
+                { name = "Abilities", value = tostring(Stats.AbilitiesFired),   inline = true },
+                { name = "Gadgets",  value = tostring(Stats.GadgetsFired),      inline = true },
+                { name = "Specials", value = tostring(Stats.SpecialsFired),     inline = true },
+                { name = "Revives",  value = tostring(Stats.Revives),           inline = true },
+                { name = "Cards",    value = tostring(Stats.Cards),             inline = true },
+                { name = "Gates",    value = tostring(Stats.GatesFired),        inline = true },
+                { name = "Coins",    value = Data and tostring(Data.Coins)    or "?", inline = true },
+                { name = "Level",    value = Data and tostring(Data.Level)    or "?", inline = true },
+                { name = "Rebirth",  value = Data and tostring(Data.Rebirths) or "?", inline = true },
             }, 7506394)
         end)
     end
 end)
 
--- Current target ping (every 5s)
-task.spawn(function()
-    while true do
-        task.wait(5)
-        if not Alive() then break end
-        if not Running then continue end
-
-        Safe("CurrentTargetPing", function()
-            local Target = CurrentTarget
-            if not Target or not Target.Parent then
-                SendWebhook("Current Target", { { name = "Target", value = "(none)", inline = true } }, 10070709)
-                return
-            end
-
-            local HP   = tostring(GetHP(Target) or "?")
-            local Dist = "?"
-            local Root = ResolveRoot(Target)
-            if Root and Root.Parent and HRP and HRP.Parent then
-                Dist = tostring(math.floor((Root.Position - HRP.Position).Magnitude))
-            end
-
-            SendWebhook("Current Target", {
-                { name = "Name",     value = Target.Name, inline = true },
-                { name = "HP",       value = HP,          inline = true },
-                { name = "Distance", value = Dist,        inline = true },
-            }, 3447003)
-        end)
-    end
-end)
-
--- ─── CHARACTER SETUP ─────────────────────────────────────────────────────────
-
-local function WaitForForceField(Char, Timeout)
+-- ─── CHARACTER SETUP (ForceField walk-off) ───────────────────────────────────
+local function WaitForFF(Char, Timeout)
     local Deadline = tick() + (Timeout or 5)
     while tick() < Deadline do
+        if not Alive() then return end
         if not Char or not Char.Parent then return end
         if not Char:FindFirstChildOfClass("ForceField") then return end
         task.wait(0.1)
     end
 end
 
-local HealthChangedConn = nil
+local HealthConn = nil
 local function SetupCharacter(NewCharacter)
     Safe("SetupCharacter", function()
-        print("[StoryFarm] Character ready")
-        Character  = NewCharacter
-        Humanoid   = NewCharacter:WaitForChild("Humanoid", 10)
-        HRP        = NewCharacter:WaitForChild("HumanoidRootPart", 10)
-        Attacking  = false
+        Character = NewCharacter
+        Humanoid  = NewCharacter:WaitForChild("Humanoid", 10)
+        HRP       = NewCharacter:WaitForChild("HumanoidRootPart", 10)
+        SlotCooldownEnd        = { 0, 0, 0, 0, 0 }
+        GadgetCooldownEnd      = 0
+        SpecialCooldownEnd     = 0
+        LastM1                 = 0
         CurrentTarget          = nil
         ActiveTargetHPBaseline = nil
         ActiveTargetBaselineAt = nil
-        SlotCooldownEnd        = { 0, 0, 0, 0 }
-        LastDamageAt = 0
-        LastSeenHP   = nil
+        LastDamageAt           = 0
+        LastSeenHP             = Humanoid and Humanoid.Health
 
-        if not Humanoid or not HRP then
-            print("[StoryFarm] Missing Humanoid/HRP after spawn")
-            return
+        if HealthConn then pcall(function() HealthConn:Disconnect() end) end
+        if Humanoid then
+            HealthConn = Humanoid.HealthChanged:Connect(function(NewHP)
+                if LastSeenHP and NewHP < LastSeenHP - 0.01 then LastDamageAt = tick() end
+                LastSeenHP = NewHP
+            end)
         end
 
-        if HealthChangedConn then pcall(function() HealthChangedConn:Disconnect() end) end
-        LastSeenHP = Humanoid.Health
-        HealthChangedConn = Humanoid.HealthChanged:Connect(function(NewHP)
-            if LastSeenHP and NewHP < LastSeenHP - 0.01 then LastDamageAt = tick() end
-            LastSeenHP = NewHP
-        end)
+        HookRevive(NewCharacter)
 
-        HookReviveListener(NewCharacter)
-
-        -- Walk forward to clear spawn ForceField
+        -- Walk forward 20 studs to break ForceField (CFrame TPs alone don't trigger it)
         Safe("WalkOutOfSpawn", function()
-            local MoveTarget = HRP.Position + HRP.CFrame.LookVector * 20
-            Humanoid:MoveTo(MoveTarget)
+            if not IsCharValid() then return end
+            local Target = HRP.Position + HRP.CFrame.LookVector * 20
+            Humanoid:MoveTo(Target)
             local Done = false
             local Conn = Humanoid.MoveToFinished:Connect(function() Done = true end)
             local Deadline = tick() + 3
             while not Done and tick() < Deadline do
+                if not Alive() then break end
                 if not IsCharValid() then break end
                 task.wait(0.1)
             end
             pcall(function() Conn:Disconnect() end)
         end)
-
-        WaitForForceField(NewCharacter, 5)
-
-        if not IsCharValid() then return end
-        Safe("InitialUnderground", GoUnderground)
-        print("[StoryFarm] Underground, hunting")
+        WaitForFF(NewCharacter, 5)
+        print("[StoryFarm] Character ready, hunting")
     end)
 end
 
 LocalPlayer.CharacterAdded:Connect(SetupCharacter)
 if Character and Character.Parent then task.spawn(SetupCharacter, Character) end
 
--- Stuck-floating recovery: if >15s with no attack while zombies exist, TP to SpawnPoint
-task.spawn(function()
-    while true do
-        task.wait(2)
-        if not Alive() then break end
-        if not Running then continue end
-        if not IsCharValid() then continue end
-        if workspace:FindFirstChild("GameFinished") then continue end
-        if workspace:FindFirstChild("Cutscene") then continue end
-        if tick() - LastAttackAt < 15 then continue end
-
-        local Folder = workspace:FindFirstChild("Zombies")
-        if not Folder or #Folder:GetDescendants() == 0 then continue end
-
-        Safe("StuckRecovery", function()
-            local Map   = workspace:FindFirstChild("Map")
-            local Spawn = Map and Map:FindFirstChild("SpawnPoint")
-            if Spawn and Spawn:IsA("BasePart") then
-                print("[StoryFarm] Stuck for " .. math.floor(tick() - LastAttackAt) .. "s, TPing to SpawnPoint")
-                HRP.CFrame = Spawn.CFrame + Vector3.new(0, 3, 0)
-                HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-                LastAttackAt = tick()
-            end
-        end)
-    end
-end)
-
--- ─── RELOAD BUTTON ───────────────────────────────────────────────────────────
-
+-- ─── RELOAD BUTTON (cyan) ────────────────────────────────────────────────────
 local function MakeReloadButton()
     local old = LocalPlayer.PlayerGui:FindFirstChild("StoryFarmGUI")
     if old then old:Destroy() end
@@ -1079,19 +939,18 @@ local function MakeReloadButton()
     sg.Parent         = LocalPlayer.PlayerGui
 
     local btn = Instance.new("TextButton")
-    btn.Size             = UDim2.new(0, 150, 0, 38)
-    btn.Position         = UDim2.new(0.5, -75, 0.5, -19)
+    btn.Size             = UDim2.new(0, 160, 0, 38)
+    btn.Position         = UDim2.new(0.5, -80, 0.5, -19)
     btn.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
     btn.TextColor3       = Color3.fromRGB(80, 220, 255)
     btn.Font             = Enum.Font.GothamBold
     btn.TextSize         = 14
-    btn.Text             = "⟳  RELOAD FARM"
+    btn.Text             = "⟳  RELOAD STORY"
     btn.BorderSizePixel  = 0
     btn.Parent           = sg
 
     Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
-
-    local stroke     = Instance.new("UIStroke", btn)
+    local stroke = Instance.new("UIStroke", btn)
     stroke.Color     = Color3.fromRGB(80, 220, 255)
     stroke.Thickness = 1.2
 
@@ -1105,3 +964,17 @@ local function MakeReloadButton()
 end
 
 MakeReloadButton()
+
+-- ─── BOOT PING ───────────────────────────────────────────────────────────────
+task.spawn(function()
+    task.wait(2)
+    pcall(function()
+        SendWebhook("StoryFarm Started", {
+            { name = "Session", value = tostring(MySession),         inline = true },
+            { name = "Time",    value = os.date("%Y-%m-%d %H:%M:%S"), inline = true },
+            { name = "Ability", value = tostring(ShowcasingAbility), inline = true },
+            { name = "Gadget",  value = tostring(GadgetName),        inline = true },
+            { name = "Special", value = tostring(SpecialName),       inline = true },
+        }, 3447003)
+    end)
+end)
