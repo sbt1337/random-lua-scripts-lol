@@ -747,6 +747,30 @@ local function CFrameAtPrompt(Row, HRPos)
     return CFrame.new(Pos + Vector3.new(0, 3, 0))
 end
 
+-- Potassium / executor: fires ProximityPrompt.Triggered (see
+-- https://docs.potassium.pro/api-reference/Instance%20Library/fireproximityprompt ).
+local function TryFireProximityPrompt(Pp)
+    if not Pp or not Pp:IsA("ProximityPrompt") or not Pp.Parent then return end
+    if pcall(function()
+        fireproximityprompt(Pp)
+    end) then
+        return
+    end
+    pcall(function()
+        local Fn
+        if getgenv then
+            Fn = getgenv().fireproximityprompt
+        end
+        if type(Fn) ~= "function" and _G then
+            Fn = rawget(_G, "fireproximityprompt")
+        end
+        if type(Fn) == "function" then
+            Fn(Pp)
+        end
+    end)
+end
+
+-- Returns CFrame, label, ProximityPrompt (or nil, nil, nil). Third value is for fireproximityprompt.
 local function GetEscapeTeleportCFrame()
     local Map = workspace:FindFirstChild("Map")
     local HRPos = IsCharValid() and HRP.Position or nil
@@ -761,7 +785,7 @@ local function GetEscapeTeleportCFrame()
 
     local Row = PickBestEscapePrompt(Prior, HRPos) or PickClosestPrompt(Prior, HRPos)
     if Row then
-        return CFrameAtPrompt(Row, HRPos), "ProximityPrompt"
+        return CFrameAtPrompt(Row, HRPos), "ProximityPrompt", Row.Prompt
     end
 
     if Map then
@@ -769,12 +793,15 @@ local function GetEscapeTeleportCFrame()
         ScanEscapeProximityUnder(Map, All)
         Row = PickBestEscapePrompt(All, HRPos) or PickClosestPrompt(All, HRPos)
         if Row then
-            return CFrameAtPrompt(Row, HRPos), "ProximityPrompt(Map)"
+            return CFrameAtPrompt(Row, HRPos), "ProximityPrompt(Map)", Row.Prompt
         end
     end
 
     for _, Part in ipairs(CollectionService:GetTagged("EscapePrompt")) do
-        if Part:IsA("BasePart") then return Part.CFrame * CFrame.new(0, 3, 0), "Tagged" end
+        if Part:IsA("BasePart") then
+            local Pp = Part:FindFirstChildWhichIsA("ProximityPrompt", true)
+            return Part.CFrame * CFrame.new(0, 3, 0), "Tagged", Pp
+        end
     end
 
     local Legacy = Map and Map:FindFirstChild("Train", true)
@@ -782,7 +809,7 @@ local function GetEscapeTeleportCFrame()
         local Hit = Legacy:FindFirstChild("ProximityPrompt", true)
         if Hit and Hit:IsA("ProximityPrompt") then
             local Cf = PromptToWorldCFrame(Hit)
-            if Cf then return Cf * CFrame.new(0, 2, 0), "TrainPromptDeep" end
+            if Cf then return Cf * CFrame.new(0, 2, 0), "TrainPromptDeep", Hit end
         end
     end
 
@@ -815,8 +842,14 @@ local function GetEscapeTeleportCFrame()
             end
         end
     end
-    if Part then return Part.CFrame + Vector3.new(0, 3, 0), Kind end
-    return nil, nil
+    if Part then
+        local Pp = Part:FindFirstChildWhichIsA("ProximityPrompt", true)
+        if not Pp and Part.Parent then
+            Pp = Part.Parent:FindFirstChildWhichIsA("ProximityPrompt", true)
+        end
+        return Part.CFrame + Vector3.new(0, 3, 0), Kind, Pp
+    end
+    return nil, nil, nil
 end
 
 local function HasEscapeObjective()
@@ -845,11 +878,16 @@ task.spawn(function()
         if not Active then continue end
 
         Safe("AutoEscape", function()
-            local Cf, Kind = GetEscapeTeleportCFrame()
-            if not Cf then return end
-            HRP.CFrame = Cf
-            HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-            print("[StoryFarm] Escaping via " .. tostring(Kind) .. " (" .. ObjName .. ")")
+            local Cf, Kind, Pp = GetEscapeTeleportCFrame()
+            if Cf then
+                HRP.CFrame = Cf
+                HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                task.wait(0.1)
+            end
+            TryFireProximityPrompt(Pp)
+            if Cf or Pp then
+                print("[StoryFarm] Escaping via " .. tostring(Kind) .. " fireprox (" .. ObjName .. ")")
+            end
         end)
     end
 end)
