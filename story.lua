@@ -152,22 +152,55 @@ task.spawn(function()
             local SS = workspace:FindFirstChild("SwitchingSection") and "Y" or "N"
             local CS = workspace:FindFirstChild("Cutscene")         and "Y" or "N"
 
+            -- MatchConfig diagnostics
+            local Section  = "?"
+            local MC = workspace:FindFirstChild("MatchConfig")
+            if MC then
+                local SecVal = MC:FindFirstChild("CurrentSection")
+                if SecVal then Section = tostring(SecVal.Value) end
+            end
+
+            -- Gate diagnostics
+            local Gates      = CollectionService:GetTagged("GateHitbox")
+            local GateOpen   = 0
+            local GateClosed = 0
+            for _, G in ipairs(Gates) do
+                if G and G.Parent then
+                    if G.Parent:GetAttribute("Opened") then GateOpen  += 1
+                    else                                     GateClosed += 1 end
+                end
+            end
+
+            -- Objectives diagnostics
+            local ObjStrs  = {}
+            local ObjFolder = workspace:FindFirstChild("Objectives")
+            if ObjFolder then
+                for _, Obj in ipairs(ObjFolder:GetChildren()) do
+                    local MaxV = Obj:GetAttribute("MaxValue")
+                    local Val  = pcall(function() return Obj.Value end) and Obj.Value or "?"
+                    local Disp = MaxV and (tostring(MaxV) .. "->" .. tostring(Val)) or tostring(Val)
+                    table.insert(ObjStrs, Obj.Name .. "[" .. Disp .. "]")
+                end
+            end
+
             print("[Heartbeat] running=" .. tostring(Running)
                 .. " zombies=" .. InFolder
+                .. " section=" .. Section
                 .. " attacks=" .. Stats.AttacksAttempted
-                .. " matches=" .. Stats.MatchesCompleted
                 .. " sinceAttack=" .. SinceAttack .. "s"
                 .. " GF=" .. GF .. " SS=" .. SS .. " CS=" .. CS)
+            print("[Heartbeat] gates(closed=" .. GateClosed .. " open=" .. GateOpen .. ")"
+                .. " objectives=[" .. (#ObjStrs > 0 and table.concat(ObjStrs, ", ") or "none") .. "]")
 
-            if SinceAttack > 120 and InFolder > 0 and Running
-                and (tick() - LastStuckAlarm) > 300 then
+            if SinceAttack > 120 and Running and (tick() - LastStuckAlarm) > 300 then
                 LastStuckAlarm = tick()
                 SendWebhook("Script Stalled", {
-                    { name = "SinceAttack",  value = SinceAttack .. "s", inline = true },
-                    { name = "InFolder",     value = tostring(InFolder), inline = true },
-                    { name = "GameFinished", value = GF,                 inline = true },
-                    { name = "Switching",    value = SS,                 inline = true },
-                    { name = "Cutscene",     value = CS,                 inline = true },
+                    { name = "SinceAttack",  value = SinceAttack .. "s",                    inline = true },
+                    { name = "Zombies",      value = tostring(InFolder),                    inline = true },
+                    { name = "Section",      value = Section,                               inline = true },
+                    { name = "GF/SS/CS",     value = GF .. "/" .. SS .. "/" .. CS,          inline = true },
+                    { name = "Gates",        value = "closed=" .. GateClosed .. " open=" .. GateOpen, inline = true },
+                    { name = "Objectives",   value = #ObjStrs > 0 and table.concat(ObjStrs, "\n") or "(none)", inline = false },
                     { name = "CurrentTarget",
                       value = (CurrentTarget and CurrentTarget.Parent) and CurrentTarget.Name or "(none)",
                       inline = false },
@@ -797,23 +830,26 @@ task.spawn(function()
             if not Interact then return end
 
             local Gates = CollectionService:GetTagged("GateHitbox")
-            if #Gates == 0 then return end
+            print("[GateOpener] " .. #Gates .. " GateHitbox parts found")
 
             for _, Gate in ipairs(Gates) do
                 if not Gate or not Gate.Parent then continue end
-                if Gate.Parent:GetAttribute("Opened") then continue end
 
-                -- TP on top of the gate so server-side distance checks pass
+                local AlreadyOpen = Gate.Parent:GetAttribute("Opened")
+                print("[GateOpener] gate=" .. Gate.Parent.Name
+                    .. " opened=" .. tostring(AlreadyOpen))
+
+                -- TP directly onto the gate part and wait for position to replicate
                 local GatePart = Gate:IsA("BasePart") and Gate
                     or Gate:FindFirstChildWhichIsA("BasePart")
-                if GatePart then
+                if GatePart and IsCharValid() then
                     HRP.CFrame = CFrame.new(GatePart.Position + Vector3.new(0, 3, 0))
                     HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-                    task.wait(0.05)
+                    task.wait(0.3) -- wait for server to see our new position
                 end
 
-                print("[StoryFarm] Firing GateHit: " .. Gate.Parent.Name)
                 Interact:FireServer("GateHit", Gate.Parent)
+                print("[GateOpener] Fired GateHit → " .. Gate.Parent.Name)
             end
         end)
     end
@@ -1031,7 +1067,7 @@ local function MakeReloadButton()
     btn.Size             = UDim2.new(0, 150, 0, 38)
     btn.Position         = UDim2.new(0.5, -75, 0.5, -19)
     btn.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
-    btn.TextColor3       = Color3.fromRGB(255, 75, 75)
+    btn.TextColor3       = Color3.fromRGB(255, 160, 40)
     btn.Font             = Enum.Font.GothamBold
     btn.TextSize         = 14
     btn.Text             = "⟳  RELOAD FARM"
@@ -1041,7 +1077,7 @@ local function MakeReloadButton()
     Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
 
     local stroke     = Instance.new("UIStroke", btn)
-    stroke.Color     = Color3.fromRGB(255, 75, 75)
+    stroke.Color     = Color3.fromRGB(255, 160, 40)
     stroke.Thickness = 1.2
 
     btn.MouseButton1Click:Connect(function()
