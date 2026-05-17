@@ -145,7 +145,7 @@ task.spawn(function()
         task.wait(30)
         pcall(function()
             local Folder      = workspace:FindFirstChild("Zombies")
-            local InFolder    = Folder and #Folder:GetChildren() or 0
+            local InFolder    = Folder and #Folder:GetDescendants() or 0
             local SinceAttack = math.floor(tick() - LastAttackAt)
             local GF = workspace:FindFirstChild("GameFinished")    and "Y" or "N"
             local SS = workspace:FindFirstChild("SwitchingSection") and "Y" or "N"
@@ -370,14 +370,14 @@ local function GetHP(Model)
 end
 
 -- ─── ZOMBIE TARGETING ───────────────────────────────────────────────────────
--- No cache. Every pick directly reads workspace.Zombies:GetChildren().
+-- No cache. Every pick directly reads workspace.Zombies descendants.
 -- If a model has been on the SkipUntil list and time expired, it gets retried
 -- automatically next pick cycle.
 
 local function GetLiveZombies()
     local Folder = workspace:FindFirstChild("Zombies")
     if not Folder then return {} end
-    return Folder:GetChildren()
+    return Folder:GetDescendants()
 end
 
 local function PickTarget()
@@ -1088,7 +1088,7 @@ task.spawn(function()
         if tick() - LastAttackAt < 15 then continue end
 
         local Folder = workspace:FindFirstChild("Zombies")
-        if not Folder or #Folder:GetChildren() == 0 then continue end
+        if not Folder or #Folder:GetDescendants() == 0 then continue end
 
         Safe("StuckRecovery", function()
             local Map   = workspace:FindFirstChild("Map")
