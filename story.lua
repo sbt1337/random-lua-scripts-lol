@@ -654,6 +654,76 @@ task.spawn(function()
     end
 end)
 
+-- ─── FINAL ESCAPE (Shibuya Train / Impel Down Door) ─────────────────────────
+-- When the "Escape ..." objective appears, TP to the map exit so the server
+-- detects proximity and fires the Escaped event (_LocalFX.lua:15892).
+-- Separate from GateHitbox which handles between-section gates.
+
+local function GetEscapePart()
+    local Map = workspace:FindFirstChild("Map")
+    if not Map then return nil, nil end
+
+    local Train = Map:FindFirstChild("Train")
+    if Train then
+        local Model = Train:FindFirstChild("Model")
+        if Model then
+            return Model.PrimaryPart or Model:FindFirstChildWhichIsA("BasePart"), "Train"
+        end
+    end
+
+    local Objective = Map:FindFirstChild("Objective")
+    if Objective then
+        local Entries = Objective:FindFirstChild("Entries")
+        if Entries then
+            local Model = Entries:FindFirstChild("Model")
+            if Model then
+                local Door = Model:FindFirstChild("Door")
+                if Door then
+                    if Door:IsA("BasePart") then return Door, "Door" end
+                    return Door.PrimaryPart or Door:FindFirstChildWhichIsA("BasePart"), "Door"
+                end
+            end
+        end
+    end
+
+    return nil, nil
+end
+
+local function HasEscapeObjective()
+    local Folder = workspace:FindFirstChild("Objectives")
+    if not Folder then return false end
+    for _, Obj in ipairs(Folder:GetChildren()) do
+        if not Obj:GetAttribute("Hidden") then
+            if string.sub(Obj.Name, 1, 6):lower() == "escape" then
+                return true, Obj.Name
+            end
+        end
+    end
+    return false
+end
+
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if not Alive() then break end
+        if not Running then continue end
+        if not IsCharValid() then continue end
+        if workspace:FindFirstChild("GameFinished") then continue end
+        if workspace:FindFirstChild("Cutscene")     then continue end
+
+        local Active, ObjName = HasEscapeObjective()
+        if not Active then continue end
+
+        Safe("AutoEscape", function()
+            local Part, Kind = GetEscapePart()
+            if not Part then return end
+            HRP.CFrame = Part.CFrame + Vector3.new(0, 3, 0)
+            HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+            print("[StoryFarm] Escaping via " .. Kind .. " (" .. ObjName .. ")")
+        end)
+    end
+end)
+
 -- ─── AUTO REVIVE ─────────────────────────────────────────────────────────────
 local LastReviveAt = 0
 local function FireRevive(Source)
