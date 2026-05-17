@@ -48,6 +48,7 @@ local Stats = {
 
 local WEBHOOK     = "https://discord.com/api/webhooks/1503857688118034662/H3y9e9EUyyZyRnKCQ-X_eIdRpejU8OwStg22dzEoycfGt__iAhRTYmnumIenbFWEckS7"
 local LOG_WEBHOOK = "https://discord.com/api/webhooks/1504232139749720074/D_Oe_5gwVDguw2eUeqZbKvpmxBLeajcEZxClzS4tvyAyS80zlL3iOLHsrpOTXUsh_gdu"
+local RAW_URL     = "https://raw.githubusercontent.com/sbt1337/random-lua-scripts-lol/refs/heads/main/story.lua"
 
 local UNDERGROUND_Y          = 10
 local ATTACK_HEIGHT          = 5
@@ -1102,3 +1103,43 @@ task.spawn(function()
         end)
     end
 end)
+
+-- ─── RELOAD BUTTON ───────────────────────────────────────────────────────────
+
+local function MakeReloadButton()
+    local old = LocalPlayer.PlayerGui:FindFirstChild("StoryFarmGUI")
+    if old then old:Destroy() end
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name           = "StoryFarmGUI"
+    sg.ResetOnSpawn   = false
+    sg.IgnoreGuiInset = true
+    sg.Parent         = LocalPlayer.PlayerGui
+
+    local btn = Instance.new("TextButton")
+    btn.Size             = UDim2.new(0, 150, 0, 38)
+    btn.Position         = UDim2.new(0.5, -75, 0.5, -19)
+    btn.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+    btn.TextColor3       = Color3.fromRGB(255, 75, 75)
+    btn.Font             = Enum.Font.GothamBold
+    btn.TextSize         = 14
+    btn.Text             = "⟳  RELOAD FARM"
+    btn.BorderSizePixel  = 0
+    btn.Parent           = sg
+
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
+
+    local stroke     = Instance.new("UIStroke", btn)
+    stroke.Color     = Color3.fromRGB(255, 75, 75)
+    stroke.Thickness = 1.2
+
+    btn.MouseButton1Click:Connect(function()
+        Running = false
+        print("[StoryFarm] Reloading...")
+        sg:Destroy()
+        task.wait(0.3)
+        loadstring(game:HttpGet(RAW_URL))()
+    end)
+end
+
+MakeReloadButton()
