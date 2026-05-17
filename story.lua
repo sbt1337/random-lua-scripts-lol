@@ -772,138 +772,49 @@ task.spawn(function()
     end)
 end)
 
--- ─── AUTO ESCAPE ─────────────────────────────────────────────────────────────
 
-local function GetEscapePart()
-    local Map = workspace:FindFirstChild("Map")
-    if not Map then return nil end
-
-    local Train = Map:FindFirstChild("Train")
-    if Train then
-        local Model = Train:FindFirstChild("Model")
-        if Model then
-            return Model.PrimaryPart or Model:FindFirstChildWhichIsA("BasePart"), "Train"
-        end
-    end
-
-    local Objective = Map:FindFirstChild("Objective")
-    if Objective then
-        local Entries = Objective:FindFirstChild("Entries")
-        if Entries then
-            local Model = Entries:FindFirstChild("Model")
-            if Model then
-                local Door = Model:FindFirstChild("Door")
-                if Door then
-                    if Door:IsA("BasePart") then return Door, "Door" end
-                    return Door.PrimaryPart or Door:FindFirstChildWhichIsA("BasePart"), "Door"
-                end
-            end
-        end
-    end
-
-    return nil
-end
-
-local FireProx = fireproximityprompt
-    or (syn and syn.fireproximityprompt)
-    or (getgenv and getgenv().fireproximityprompt)
-
-local FiredEscapePrompts = setmetatable({}, { __mode = "k" })
-
-local function IsEscapePrompt(Prompt)
-    if not Prompt:IsA("ProximityPrompt") then return false end
-    if not Prompt.Enabled then return false end
-    local Combined = string.lower(
-        (Prompt.Name or "") .. " " .. (Prompt.ActionText or "") .. " " .. (Prompt.ObjectText or "")
-    )
-    return string.find(Combined, "escape", 1, true) ~= nil
-end
-
-local function ResolvePromptPart(Prompt)
-    local Node = Prompt.Parent
-    while Node and Node ~= workspace do
-        if Node:IsA("BasePart") then return Node end
-        if Node:IsA("Model") then
-            local Pivot = Node.PrimaryPart or Node:FindFirstChildWhichIsA("BasePart")
-            if Pivot then return Pivot end
-        end
-        Node = Node.Parent
-    end
-    return nil
-end
-
-local function FindEscapePrompt()
-    local Objectives = workspace:FindFirstChild("Objectives")
-    if Objectives then
-        for _, Inst in ipairs(Objectives:GetDescendants()) do
-            if IsEscapePrompt(Inst) then return Inst end
-        end
-    end
-    for _, Inst in ipairs(workspace:GetDescendants()) do
-        if IsEscapePrompt(Inst) then return Inst end
-    end
-    return nil
-end
-
-task.spawn(function()
-    Safe("EscapePromptSpammer", function()
-        while true do
-            task.wait(0.1)
-            if not Running then continue end
-            if not IsCharValid() then continue end
-
-            local Prompt = FindEscapePrompt()
-            if not Prompt then continue end
-
-            local Part = ResolvePromptPart(Prompt)
-            if Part then
-                HRP.CFrame = Part.CFrame + Vector3.new(0, 3, 0)
-                HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-            end
-
-            if FireProx then Safe("FireProx", function() FireProx(Prompt) end) end
-
-            if not FiredEscapePrompts[Prompt] then
-                FiredEscapePrompts[Prompt] = tick()
-                print("[StoryFarm] Escape prompt: " .. Prompt:GetFullName()
-                    .. " action='" .. (Prompt.ActionText or "")
-                    .. "' object='" .. (Prompt.ObjectText or "") .. "'"
-                    .. " tp=" .. (Part and Part:GetFullName() or "(no part)"))
-            end
-        end
-    end)
-end)
-
-local function HasEscapeObjective()
-    local Folder = workspace:FindFirstChild("Objectives")
-    if not Folder then return false end
-    for _, Obj in ipairs(Folder:GetChildren()) do
-        if not Obj:GetAttribute("Hidden") then
-            if string.sub(Obj.Name, 1, 6):lower() == "escape" then
-                return true, Obj.Name
-            end
-        end
-    end
-    return false
-end
+-- ─── GATE OPENER ─────────────────────────────────────────────────────────────
+-- Decompile shows section advance is NOT a ProximityPrompt.
+-- Parts tagged "GateHitbox" (CollectionService) trigger Interact:FireServer("GateHit", gate.Parent)
+-- when touched. We're underground when sections clear so we never touch them.
+-- Fix: when zombies=0 and un-opened gates exist, TP to them and fire GateHit directly.
 
 task.spawn(function()
     while true do
         task.wait(1)
         if not Running then continue end
+        if not IsCharValid() then continue end
         if workspace:FindFirstChild("GameFinished") then continue end
         if workspace:FindFirstChild("Cutscene") then continue end
-        if not IsCharValid() then continue end
+        if workspace:FindFirstChild("SwitchingSection") then continue end
 
-        local Active, ObjName = HasEscapeObjective()
-        if not Active then continue end
+        local Folder     = workspace:FindFirstChild("Zombies")
+        local ZombieCount = Folder and #Folder:GetDescendants() or 0
+        if ZombieCount > 0 then continue end
 
-        Safe("AutoEscape", function()
-            local Part, Kind = GetEscapePart()
-            if not Part then return end
-            print("[StoryFarm] Objective '" .. ObjName .. "' active, TPing to " .. Kind)
-            HRP.CFrame = Part.CFrame + Vector3.new(0, 3, 0)
-            HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        Safe("GateOpener", function()
+            local Interact = GetInteract()
+            if not Interact then return end
+
+            local Gates = CollectionService:GetTagged("GateHitbox")
+            if #Gates == 0 then return end
+
+            for _, Gate in ipairs(Gates) do
+                if not Gate or not Gate.Parent then continue end
+                if Gate.Parent:GetAttribute("Opened") then continue end
+
+                -- TP on top of the gate so server-side distance checks pass
+                local GatePart = Gate:IsA("BasePart") and Gate
+                    or Gate:FindFirstChildWhichIsA("BasePart")
+                if GatePart then
+                    HRP.CFrame = CFrame.new(GatePart.Position + Vector3.new(0, 3, 0))
+                    HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                    task.wait(0.05)
+                end
+
+                print("[StoryFarm] Firing GateHit: " .. Gate.Parent.Name)
+                Interact:FireServer("GateHit", Gate.Parent)
+            end
         end)
     end
 end)
