@@ -23,6 +23,11 @@ do
     end)
 end
 
+-- Session token: incremented each execution so old loops can detect a reload and break
+_G.StoryFarmSession = (_G.StoryFarmSession or 0) + 1
+local MySession = _G.StoryFarmSession
+local function Alive() return _G.StoryFarmSession == MySession end
+
 local Running             = true
 local Attacking           = false
 local AttackStartTime     = 0
@@ -133,6 +138,7 @@ end
 task.spawn(function()
     while true do
         task.wait(3)
+        if not Alive() then break end
         pcall(FlushLogs)
     end
 end)
@@ -144,6 +150,7 @@ local LastStuckAlarm = 0
 task.spawn(function()
     while true do
         task.wait(30)
+        if not Alive() then break end
         pcall(function()
             local Folder      = workspace:FindFirstChild("Zombies")
             local InFolder    = Folder and #Folder:GetDescendants() or 0
@@ -486,6 +493,7 @@ end
 
 -- Noclip
 RunService.Stepped:Connect(function()
+    if not Alive() then return end
     if not Running then return end
     if not Character or not Character.Parent then return end
     Safe("Noclip", function()
@@ -499,6 +507,7 @@ end)
 task.spawn(function()
     while true do
         task.wait(1)
+        if not Alive() then break end
         if Attacking and (tick() - AttackStartTime) > ATTACK_TIMEOUT then
             print("[StoryFarm] Stuck for " .. math.floor(tick() - AttackStartTime) .. "s, force release")
             Attacking = false
@@ -587,6 +596,7 @@ end
 task.spawn(function()
     while true do
         task.wait(0.05)
+        if not Alive() then break end
         if not Running then continue end
         if Attacking then continue end
         if not IsCharValid() then task.wait(0.5) continue end
@@ -733,6 +743,7 @@ end)
 task.spawn(function()
     while true do
         task.wait(10)
+        if not Alive() then break end
         if not Running then continue end
 
         Safe("AutoRebirth", function()
@@ -815,6 +826,7 @@ end)
 task.spawn(function()
     while true do
         task.wait(1)
+        if not Alive() then break end
         if not Running then continue end
         if not IsCharValid() then continue end
         if workspace:FindFirstChild("GameFinished") then continue end
@@ -907,6 +919,7 @@ end)
 task.spawn(function()
     while true do
         task.wait(STATS_INTERVAL)
+        if not Alive() then break end
         if not Running then continue end
 
         Safe("StatsReport", function()
@@ -935,6 +948,7 @@ end)
 task.spawn(function()
     while true do
         task.wait(5)
+        if not Alive() then break end
         if not Running then continue end
 
         Safe("CurrentTargetPing", function()
@@ -1029,6 +1043,7 @@ if Character and Character.Parent then task.spawn(SetupCharacter, Character) end
 task.spawn(function()
     while true do
         task.wait(2)
+        if not Alive() then break end
         if not Running then continue end
         if not IsCharValid() then continue end
         if workspace:FindFirstChild("GameFinished") then continue end
