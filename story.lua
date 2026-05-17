@@ -1082,7 +1082,7 @@ local function MakeReloadButton()
     btn.Size             = UDim2.new(0, 150, 0, 38)
     btn.Position         = UDim2.new(0.5, -75, 0.5, -19)
     btn.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
-    btn.TextColor3       = Color3.fromRGB(255, 160, 40)
+    btn.TextColor3       = Color3.fromRGB(80, 220, 255)
     btn.Font             = Enum.Font.GothamBold
     btn.TextSize         = 14
     btn.Text             = "⟳  RELOAD FARM"
@@ -1092,7 +1092,7 @@ local function MakeReloadButton()
     Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
 
     local stroke     = Instance.new("UIStroke", btn)
-    stroke.Color     = Color3.fromRGB(255, 160, 40)
+    stroke.Color     = Color3.fromRGB(80, 220, 255)
     stroke.Thickness = 1.2
 
     btn.MouseButton1Click:Connect(function()
