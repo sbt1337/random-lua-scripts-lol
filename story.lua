@@ -5,7 +5,7 @@
 --   - Health.Value > 0 = ALIVE (LiveRadar/Handler.lua:190)
 --   - All 5 ability slots (Z=1, X=2, C=3, V=4, G=5)
 --   - Gadget (E) + Special (Q) fired alongside
---   - TP onto target, no underground hiding (kills throughput)
+--   - TP onto target; dip under target while Z/X/C/V are all on cooldown (noclip)
 --   - GateHit for section advance (SetupGate at _LocalFX.lua:17418)
 
 if game.PlaceId == 140409475718339 then return end
@@ -48,6 +48,7 @@ local GADGET_CD          = 0.5
 local SPECIAL_SOFT_CD    = 1
 local SLOT_COUNT         = 4   -- Z/X/C/V only; G (slot 5) is weapon ult, skip it
 local TP_RANGE_MAX       = 8      -- TP onto target if further than this
+local UNDERGROUND_Y      = -12    -- under target when Z/X/C/V all on cooldown (noclip on)
 local NO_DAMAGE_TIMEOUT  = 10     -- skip target after this many seconds of no HP change
 local SKIP_DURATION      = 30
 local HEARTBEAT_INTERVAL = 30
@@ -431,9 +432,15 @@ RunService.Stepped:Connect(function()
     end)
 end)
 
+local function AllZxcvOnCooldown(Now)
+    for i = 1, SLOT_COUNT do
+        if SlotCooldownEnd[i] <= Now then return false end
+    end
+    return true
+end
+
 -- ─── ATTACK LOOP ─────────────────────────────────────────────────────────────
--- Infinity-style: TP onto target, fire M1 + ability + gadget + special continuously.
--- No underground dance. Lost throughput >> lost HP.
+-- TP onto target; dip under the zombie while Z/X/C/V are all cooling down (noclip).
 task.spawn(function()
     while true do
         task.wait(0.05)
@@ -480,15 +487,21 @@ task.spawn(function()
                 end
             end
 
-            -- TP onto target if too far
-            if (HRP.Position - Root.Position).Magnitude > TP_RANGE_MAX then
+            local Now = tick()
+
+            if AllZxcvOnCooldown(Now) then
+                HRP.CFrame = CFrame.new(Root.Position.X, Root.Position.Y + UNDERGROUND_Y, Root.Position.Z)
+                HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                task.wait(0.05)
+                if not IsCharValid() then return end
+            elseif (HRP.Position - Root.Position).Magnitude > TP_RANGE_MAX then
                 HRP.CFrame = CFrame.new(Root.Position)
                 HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
                 task.wait(0.05)
                 if not IsCharValid() then return end
+                Now = tick()
             end
 
-            local Now = tick()
 
             -- M1 — basic attack, ~0.4s server CD per decompile
             if Now - LastM1 >= M1_CD then
@@ -655,37 +668,154 @@ task.spawn(function()
 end)
 
 -- ─── FINAL ESCAPE (Shibuya Train / Impel Down Door) ─────────────────────────
--- When the "Escape ..." objective appears, TP to the map exit so the server
--- detects proximity and fires the Escaped event (_LocalFX.lua:15892).
--- Separate from GateHitbox which handles between-section gates.
+-- When the "Escape ..." objective appears, TP to the ProximityPrompt adornee
+-- (actual hold-E spot). TPing to Train.Model.PrimaryPart often misses the prompt.
+-- Fallback: CollectionService tag, deep Train search, then legacy Train/Door parts.
 
-local function GetEscapePart()
+local function PromptToWorldCFrame(Prompt)
+    if not Prompt or not Prompt.Parent then return nil end
+    local Adornee = Prompt.Parent
+    if Adornee:IsA("BasePart") then
+        return Adornee.CFrame
+    end
+    if Adornee:IsA("Attachment") then
+        return Adornee.WorldCFrame
+    end
+    if Adornee:IsA("Model") then
+        local Pp = Adornee.PrimaryPart or Adornee:FindFirstChildWhichIsA("BasePart", true)
+        if Pp then return Pp.CFrame end
+    end
+    local Part = Adornee:FindFirstChildWhichIsA("BasePart", true)
+    if Part then return Part.CFrame end
+    return nil
+end
+
+local function ScanEscapeProximityUnder(RootInst, Into)
+    if not RootInst then return end
+    for _, Desc in ipairs(RootInst:GetDescendants()) do
+        if Desc:IsA("ProximityPrompt") then
+            local Cf = PromptToWorldCFrame(Desc)
+            if Cf then
+                local Blob = string.lower(
+                      Desc.Name .. " "
+                    .. tostring(Desc.ActionText) .. " "
+                    .. tostring(Desc.ObjectText))
+                table.insert(Into, { Cf = Cf, Prompt = Desc, Blob = Blob })
+            end
+        end
+    end
+end
+
+local function PickBestEscapePrompt(Candidates, NearPos)
+    local Best, BestDist = nil, math.huge
+    for _, Row in ipairs(Candidates) do
+        if string.find(Row.Blob, "escape")
+            or string.find(Row.Blob, "exit")
+            or string.find(Row.Blob, "board")
+            or string.find(Row.Blob, "train")
+            or string.find(Row.Blob, "leave")
+            or string.find(Row.Blob, "door") then
+            local Dist = NearPos and (Row.Cf.Position - NearPos).Magnitude or 0
+            if Dist < BestDist then Best, BestDist = Row, Dist end
+        end
+    end
+    return Best
+end
+
+local function PickClosestPrompt(Candidates, NearPos)
+    if #Candidates == 0 then return nil end
+    if not NearPos then return Candidates[1] end
+    local Best, BestDist = nil, math.huge
+    for _, Row in ipairs(Candidates) do
+        local D = (Row.Cf.Position - NearPos).Magnitude
+        if D < BestDist then Best, BestDist = Row, D end
+    end
+    return Best
+end
+
+local function CFrameAtPrompt(Row, HRPos)
+    local Base = Row.Cf.Position
+    local Rad = 3
+    if Row.Prompt:IsA("ProximityPrompt") and Row.Prompt.MaxActivationDistance then
+        Rad = math.clamp(Row.Prompt.MaxActivationDistance * 0.35, 2, 6)
+    end
+    local Pos = Base
+    if HRPos then
+        local Horiz = Vector3.new(HRPos.X - Base.X, 0, HRPos.Z - Base.Z)
+        if Horiz.Magnitude > 0.05 then Pos = Base + Horiz.Unit * Rad end
+    end
+    return CFrame.new(Pos + Vector3.new(0, 3, 0))
+end
+
+local function GetEscapeTeleportCFrame()
     local Map = workspace:FindFirstChild("Map")
-    if not Map then return nil, nil end
+    local HRPos = IsCharValid() and HRP.Position or nil
 
-    local Train = Map:FindFirstChild("Train")
-    if Train then
-        local Model = Train:FindFirstChild("Model")
-        if Model then
-            return Model.PrimaryPart or Model:FindFirstChildWhichIsA("BasePart"), "Train"
+    local Prior = {}
+    if Map then
+        local Train = Map:FindFirstChild("Train")
+        if Train then ScanEscapeProximityUnder(Train, Prior) end
+        local Objective = Map:FindFirstChild("Objective")
+        if Objective then ScanEscapeProximityUnder(Objective, Prior) end
+    end
+
+    local Row = PickBestEscapePrompt(Prior, HRPos) or PickClosestPrompt(Prior, HRPos)
+    if Row then
+        return CFrameAtPrompt(Row, HRPos), "ProximityPrompt"
+    end
+
+    if Map then
+        local All = {}
+        ScanEscapeProximityUnder(Map, All)
+        Row = PickBestEscapePrompt(All, HRPos) or PickClosestPrompt(All, HRPos)
+        if Row then
+            return CFrameAtPrompt(Row, HRPos), "ProximityPrompt(Map)"
         end
     end
 
-    local Objective = Map:FindFirstChild("Objective")
-    if Objective then
-        local Entries = Objective:FindFirstChild("Entries")
-        if Entries then
-            local Model = Entries:FindFirstChild("Model")
+    for _, Part in ipairs(CollectionService:GetTagged("EscapePrompt")) do
+        if Part:IsA("BasePart") then return Part.CFrame * CFrame.new(0, 3, 0), "Tagged" end
+    end
+
+    local Legacy = Map and Map:FindFirstChild("Train", true)
+    if Legacy then
+        local Hit = Legacy:FindFirstChild("ProximityPrompt", true)
+        if Hit and Hit:IsA("ProximityPrompt") then
+            local Cf = PromptToWorldCFrame(Hit)
+            if Cf then return Cf * CFrame.new(0, 2, 0), "TrainPromptDeep" end
+        end
+    end
+
+    local Part, Kind = nil, nil
+    do
+        if not Map then return nil, nil end
+        local Train = Map:FindFirstChild("Train")
+        if Train then
+            local Model = Train:FindFirstChild("Model")
             if Model then
-                local Door = Model:FindFirstChild("Door")
-                if Door then
-                    if Door:IsA("BasePart") then return Door, "Door" end
-                    return Door.PrimaryPart or Door:FindFirstChildWhichIsA("BasePart"), "Door"
+                Part = Model.PrimaryPart or Model:FindFirstChildWhichIsA("BasePart")
+                Kind = "Train"
+            end
+        end
+        if not Part then
+            local Objective = Map:FindFirstChild("Objective")
+            if Objective then
+                local Entries = Objective:FindFirstChild("Entries")
+                if Entries then
+                    local Model = Entries:FindFirstChild("Model")
+                    if Model then
+                        local Door = Model:FindFirstChild("Door")
+                        if Door then
+                            if Door:IsA("BasePart") then Part = Door
+                            else Part = Door.PrimaryPart or Door:FindFirstChildWhichIsA("BasePart") end
+                            Kind = "Door"
+                        end
+                    end
                 end
             end
         end
     end
-
+    if Part then return Part.CFrame + Vector3.new(0, 3, 0), Kind end
     return nil, nil
 end
 
@@ -715,11 +845,11 @@ task.spawn(function()
         if not Active then continue end
 
         Safe("AutoEscape", function()
-            local Part, Kind = GetEscapePart()
-            if not Part then return end
-            HRP.CFrame = Part.CFrame + Vector3.new(0, 3, 0)
+            local Cf, Kind = GetEscapeTeleportCFrame()
+            if not Cf then return end
+            HRP.CFrame = Cf
             HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-            print("[StoryFarm] Escaping via " .. Kind .. " (" .. ObjName .. ")")
+            print("[StoryFarm] Escaping via " .. tostring(Kind) .. " (" .. ObjName .. ")")
         end)
     end
 end)
