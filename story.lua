@@ -409,6 +409,11 @@ local function PickTarget()
 end
 
 -- ─── ACTION CHECK (mirrors game's Utils.ActionCheck) ─────────────────────────
+local function HasForceField()
+    if not Character or not Character.Parent then return false end
+    return Character:FindFirstChildOfClass("ForceField") ~= nil
+end
+
 local function IsActionBlocked()
     if not IsCharValid() then return true end
     for _, Name in ipairs(BLOCKING_STATES) do
@@ -449,6 +454,25 @@ task.spawn(function()
         if not IsCharValid() then task.wait(0.5) continue end
 
         Safe("AttackLoop", function()
+            -- ForceField active: TPs are blocked, attacks do nothing. Walk toward
+            -- the nearest zombie and wait for the shield to drop naturally.
+            if HasForceField() then
+                local ZF = workspace:FindFirstChild("Zombies")
+                if ZF and Humanoid then
+                    local MyPos = HRP.Position
+                    local Best, BestDist = nil, math.huge
+                    for _, M in ipairs(ZF:GetChildren()) do
+                        if not IsAlive(M) then continue end
+                        local Root = M:FindFirstChild("HumanoidRootPart")
+                        if not Root then continue end
+                        local D = (Root.Position - MyPos).Magnitude
+                        if D < BestDist then Best, BestDist = Root, D end
+                    end
+                    if Best then Humanoid:MoveTo(Best.Position) end
+                end
+                return
+            end
+
             if IsActionBlocked() then return end
 
             local Inter = GetInteract()
@@ -489,17 +513,22 @@ task.spawn(function()
 
             local Now = tick()
 
-            if AllZxcvOnCooldown(Now) then
-                HRP.CFrame = CFrame.new(Root.Position.X, Root.Position.Y + UNDERGROUND_Y, Root.Position.Z)
-                HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-                task.wait(0.05)
-                if not IsCharValid() then return end
-            elseif (HRP.Position - Root.Position).Magnitude > TP_RANGE_MAX then
-                HRP.CFrame = CFrame.new(Root.Position)
-                HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-                task.wait(0.05)
-                if not IsCharValid() then return end
-                Now = tick()
+            if not HasForceField() then
+                if AllZxcvOnCooldown(Now) then
+                    HRP.CFrame = CFrame.new(Root.Position.X, Root.Position.Y + UNDERGROUND_Y, Root.Position.Z)
+                    HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                    task.wait(0.05)
+                    if not IsCharValid() then return end
+                elseif (HRP.Position - Root.Position).Magnitude > TP_RANGE_MAX then
+                    HRP.CFrame = CFrame.new(Root.Position)
+                    HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                    task.wait(0.05)
+                    if not IsCharValid() then return end
+                    Now = tick()
+                end
+            else
+                if Humanoid then Humanoid:MoveTo(Root.Position) end
+                return
             end
 
 
@@ -655,9 +684,19 @@ task.spawn(function()
                 local GatePart = Gate:IsA("BasePart") and Gate
                     or Gate:FindFirstChildWhichIsA("BasePart")
                 if GatePart and IsCharValid() then
-                    HRP.CFrame = CFrame.new(GatePart.Position + Vector3.new(0, 3, 0))
-                    HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-                    task.wait(0.3)
+                    if HasForceField() then
+                        if Humanoid then Humanoid:MoveTo(GatePart.Position) end
+                        local Deadline = tick() + 6
+                        while tick() < Deadline and HasForceField() do
+                            if not Alive() then return end
+                            task.wait(0.2)
+                        end
+                        task.wait(0.1)
+                    else
+                        HRP.CFrame = CFrame.new(GatePart.Position + Vector3.new(0, 3, 0))
+                        HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                        task.wait(0.3)
+                    end
                 end
                 Inter:FireServer("GateHit", Gate.Parent)
                 Stats.GatesFired += 1
@@ -880,9 +919,21 @@ task.spawn(function()
         Safe("AutoEscape", function()
             local Cf, Kind, Pp = GetEscapeTeleportCFrame()
             if Cf then
-                HRP.CFrame = Cf
-                HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-                task.wait(0.1)
+                if HasForceField() then
+                    -- can't TP through a FF; walk toward escape point and wait it out
+                    if Humanoid then Humanoid:MoveTo(Cf.Position) end
+                    local Deadline = tick() + 8
+                    while tick() < Deadline and HasForceField() do
+                        if not Alive() then return end
+                        task.wait(0.2)
+                    end
+                    task.wait(0.1)
+                end
+                if not HasForceField() then
+                    HRP.CFrame = Cf
+                    HRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                    task.wait(0.1)
+                end
             end
             TryFireProximityPrompt(Pp)
             if Cf or Pp then
