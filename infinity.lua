@@ -135,34 +135,22 @@ local function FireAbility(Key)
     SlotEnd[Key] = tick() + 0.3
 end
 
--- Track kills by watching Config.Health hit 0 on zombies
-local function WatchZombieKill(Model)
-    local Config = Model:FindFirstChild("Config")
-    local Health = Config and Config:FindFirstChild("Health")
-    if not Health then return end
-    local Conn
-    Conn = Health:GetPropertyChangedSignal("Value"):Connect(function()
-        if Health.Value <= 0 then
-            if FarmStats then FarmStats.Kills += 1 end
-            if Conn then Conn:Disconnect() end
-        end
-    end)
-end
-
--- Attach watchers to zombies as they spawn
-workspace:WaitForChild("Zombies").ChildAdded:Connect(function(M)
-    if M:IsA("Model") then WatchZombieKill(M) end
-end)
--- Catch any already-present zombies
-task.spawn(function()
-    local ZF = workspace:WaitForChild("Zombies")
-    for _, M in ipairs(ZF:GetChildren()) do
-        if M:IsA("Model") then WatchZombieKill(M) end
-    end
+-- Count kills via ChildRemoved — one connection total, no per-zombie leaks.
+-- Zombies are removed from workspace.Zombies when they die, so this is accurate.
+workspace:WaitForChild("Zombies").ChildRemoved:Connect(function(M)
+    if M:IsA("Model") and FarmStats then FarmStats.Kills += 1 end
 end)
 
 -- ── Webhook ───────────────────────────────────────────────────────────────────
 local WHThrottle = {}
+-- Purge throttle table every hour so it doesn't grow unbounded overnight
+task.spawn(function()
+    while true do
+        task.wait(3600)
+        if not Running then break end
+        table.clear(WHThrottle)
+    end
+end)
 local function SendWebhook(Title, Fields, Color)
     pcall(function()
         HttpService:RequestAsync({
@@ -375,7 +363,7 @@ local LastM1 = 0
 
 task.spawn(function()
     while Running do
-        task.wait(0.05)
+        task.wait(0.08)
         Safe("AttackLoop", function()
             if workspace:GetAttribute("Intermission") then task.wait(0.3) return end
             if not IsCharValid() then task.wait(0.5) return end
